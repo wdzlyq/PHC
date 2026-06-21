@@ -114,7 +114,7 @@ class IMAMPPlayerContinuous(amp_players.AMPPlayerContinuous):
                 try:
                     assert(all_mpjpe.shape[0] == curr_max or self.terminate_state.sum() == humanoid_env.num_envs) # Max should be the same as the number of frames in the motion.
                 except:
-                    import ipdb; ipdb.set_trace()
+                    # import ipdb; ipdb.set_trace()  # disabled for headless eval (AAA repro)
                     print('??')
 
                 all_mpjpe = [all_mpjpe[: (i - 1), idx].mean() for idx, i in enumerate(humanoid_env._motion_lib.get_motion_num_steps())] # -1 since we do not count the first frame. 
@@ -214,7 +214,7 @@ class IMAMPPlayerContinuous(amp_players.AMPPlayerContinuous):
                                 }, dump_dir, compress=True)
                         exit()
 
-                    import ipdb; ipdb.set_trace()
+                    # import ipdb; ipdb.set_trace()  # disabled for headless eval (AAA repro)
 
                     joblib.dump(failed_keys, osp.join(self.config['network_path'], "failed.pkl"))
                     joblib.dump(success_keys, osp.join(self.config['network_path'], "long_succ.pkl"))
