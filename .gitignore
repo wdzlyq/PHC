@@ -142,3 +142,6 @@ output_videos/
 *.pt
 new_trials
 gh-md-toc
+# AAA repro
+*.bak
+repro_logs/
