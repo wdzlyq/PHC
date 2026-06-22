@@ -14,8 +14,8 @@ from pathlib import Path
 
 sys.path.append(os.getcwd())
 
-from smpl_sim.khrylib.utils import get_body_qposaddr
-from smpl_sim.smpllib.smpl_mujoco import SMPL_BONE_ORDER_NAMES as joint_names
+from smpl_sim.utils.mujoco_utils import get_body_qposaddr  # AAA: khrylib moved in new smpl_sim
+from smpl_sim.smpllib.smpl_joint_names import SMPL_BONE_ORDER_NAMES as joint_names  # AAA: smpl_mujoco renamed
 from smpl_sim.smpllib.smpl_local_robot import SMPL_Robot as LocalRobot
 import scipy.ndimage.filters as filters
 from typing import List, Optional
@@ -138,7 +138,7 @@ def run(in_file: str, out_file: str):
             amass_full_motion_dict[key_name_dump] = new_motion_out
 
     Path(out_file).parents[0].mkdir(parents=True, exist_ok=True)
-    joblib.dump(amass_full_motion_dict, out_file)
+    joblib.dump(amass_full_motion_dict, out_file, compress=3)  # AAA: compress to fit disk
     return
 
 # import ipdb

@@ -65,7 +65,7 @@ if __name__ == "__main__":
     length_acc = []
     for data_path in tqdm(all_pkls):
         bound = 0
-        splits = data_path.split("/")[7:]
+        splits = os.path.relpath(data_path, args.path).split(os.sep)
         key_name_dump = "0-" + "_".join(splits).replace(".npz", "")
         
         if (not splits[0] in process_set):
@@ -148,7 +148,7 @@ if __name__ == "__main__":
 
         amass_full_motion_dict[key_name_dump] = new_motion_out
         
-    import ipdb; ipdb.set_trace()
+    # import ipdb; ipdb.set_trace()  # AAA: commented out for headless run
     if upright_start:
         joblib.dump(amass_full_motion_dict, "data/amass/amass_train_take6_upright.pkl", compress=True)
     else:
