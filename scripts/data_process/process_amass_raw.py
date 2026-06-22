@@ -185,4 +185,4 @@ if __name__ == "__main__":
      
     
     print(f"Saving AMASS dataset to {db_file}")
-    joblib.dump(db, db_file)
+    joblib.dump(db, db_file, compress=3)  # AAA: compress to fit disk
