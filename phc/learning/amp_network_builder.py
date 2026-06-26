@@ -4,6 +4,7 @@ import phc.learning.network_builder as network_builder
 import torch
 import torch.nn as nn
 import numpy as np
+from phc.learning.style_residual import StyleResidual
 
 DISC_LOGIT_INIT_SCALE = 1.0
 
@@ -28,6 +29,18 @@ class AMPBuilder(network_builder.A2CBuilder):
 
             amp_input_shape = kwargs.get('amp_input_shape')
             self._build_disc(amp_input_shape)
+
+            # === AAA: bounded style residual setup (W3) ===
+            # base = 提取的单 primitive (actor_mlp + mu)，冻结；style_residual 可训
+            self.style_enabled = True
+            _aaa_obs_dim = self.actor_mlp[0].in_features   # 945 (no cnn)
+            _aaa_act_dim = self.mu.out_features             # 69
+            self.style_residual = StyleResidual(
+                obs_dim=_aaa_obs_dim, z_style_dim=32, action_dim=_aaa_act_dim)
+            self.style_alpha = self.style_residual.style_alpha  # 暴露给 optimizer
+            for _p in self.actor_mlp.parameters(): _p.requires_grad_(False)
+            for _p in self.mu.parameters():         _p.requires_grad_(False)
+            # === AAA end ===
 
             return
 
@@ -140,6 +153,13 @@ class AMPBuilder(network_builder.A2CBuilder):
                 if self.is_continuous:
                     
                     mu = self.mu_act(self.mu(a_out))
+                    # === AAA: bounded style residual ===
+                    # mu_style = mu_base + α·tanh(Δπ(s, z_style)); α init=0
+                    _aaa_z = obs_dict.get('z_style', None)
+                    if self.style_enabled and _aaa_z is not None:
+                        _aaa_res = self.style_residual(obs, _aaa_z)
+                        mu = mu + self.style_alpha * torch.tanh(_aaa_res)
+                    # === AAA end ===
                     if self.space_config['fixed_sigma']:
                         sigma = mu * 0.0 + self.sigma_act(self.sigma)
                     else:
