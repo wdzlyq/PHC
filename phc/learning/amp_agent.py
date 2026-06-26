@@ -102,6 +102,20 @@ class AMPAgent(common_agent.CommonAgent):
         return state
 
     def set_full_state_weights(self, weights):
+        if getattr(self.model.a2c_network, 'style_enabled', False):
+            # === AAA W3: 从提取的单 primitive base ckpt 初始化（非 resume）===
+            # model: 容错加载（base 键匹配加载；style 模块 slider_encoder/style_residual/
+            #   style_alpha/aaa_style_label 保留 init，因 ckpt 无这些键）。
+            # optimizer: 跳过（ckpt optimizer 是 phc_3 全 pnn 结构，与新 model 不匹配），
+            #   用 fresh optimizer 只训 style（base requires_grad=False → grad None → Adam skip）。
+            # epoch/frame: 重置 0（fresh training）。
+            load_my_state_dict(self.model.state_dict(), weights['model'])
+            self.set_stats_weights(weights)
+            self.epoch_num = 0
+            self.frame = 0
+            self.last_mean_rewards = -100500
+            print("[AAA W3] init base from ckpt (tolerant load), fresh optimizer, epoch=0")
+            return
         super().set_full_state_weights(weights)
         if "kin_optimizer" in weights:
             print("!!!loading kin_optimizer!!! Remove this message asa p!!")
