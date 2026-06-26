@@ -29,6 +29,48 @@ class AMPPlayerContinuous(common_player.CommonPlayer):
         # self.orcale_model.load_state_dict(checkpoint['model'])
         return
 
+    def get_action(self, obs_dict, is_determenistic=False):
+        # === AAA W4: player 路径注入 slider（w4 patch §8.6 遗留点补漏，第二步验收前置）===
+        # 为什么：CommonPlayer.get_action → PpoPlayerContinuous.get_action 建 input_dict 时只塞 'obs'，
+        #   不透传 slider → eval_actor obs_dict.get('slider')=None → 回落固定 style 0（aaa_style_label）。
+        #   训练侧已由 amp_agent.get_action_values override 注入（commit 9bc3a2e），但 player 的 im_eval
+        #   路径不经过 agent，故 im_eval 模式 policy 拿不到 slider → 第二步"3-5 风格可区分"验收前必须补。
+        # 做什么：复刻 PpoPlayerContinuous.get_action 逻辑（见 rl_games algos_torch/players.py:42），
+        #   在 input_dict 加 'slider'。slider 来源：
+        #     ① 若设了 self._eval_slider_override（验收专用，固定内容切 slider 跑 rollout 对比）→ 用它；
+        #     ② 否则用 self.env.task.style_labels（与 agent override 同源，reset 时已按 motion 更新）。
+        obs = obs_dict['obs']
+        if self.has_batch_dimension == False:
+            obs = unsqueeze_obs(obs)
+        obs = self._preproc_obs(obs)
+        input_dict = {
+            'is_train': False,
+            'prev_actions': None,
+            'obs': obs,
+            'rnn_states': self.states
+        }
+        if getattr(self.model.a2c_network, 'style_enabled', False):
+            if getattr(self, '_eval_slider_override', None) is not None:
+                input_dict['slider'] = self._eval_slider_override
+            else:
+                input_dict['slider'] = self.env.task.style_labels
+        # === AAA end ===
+        with torch.no_grad():
+            res_dict = self.model(input_dict)
+        mu = res_dict['mus']
+        action = res_dict['actions']
+        self.states = res_dict['rnn_states']
+        if is_determenistic:
+            current_action = mu
+        else:
+            current_action = action
+        if self.has_batch_dimension == False:
+            current_action = torch.squeeze(current_action.detach())
+        if self.clip_actions:
+            return rescale_actions(self.actions_low, self.actions_high, torch.clamp(current_action, -1.0, 1.0))
+        else:
+            return current_action
+
     # #### Oracle debug
     # def get_action(self, obs, is_determenistic=False):
     #     obs = obs['obs']
