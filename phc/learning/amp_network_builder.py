@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from phc.learning.style_residual import StyleResidual
+from phc.learning.slider_encoder import SliderEncoder
 
 DISC_LOGIT_INIT_SCALE = 1.0
 
@@ -31,13 +32,18 @@ class AMPBuilder(network_builder.A2CBuilder):
             self._build_disc(amp_input_shape)
 
             # === AAA: bounded style residual setup (W3) ===
-            # base = 提取的单 primitive (actor_mlp + mu)，冻结；style_residual 可训
+            # base = 提取的单 primitive (actor_mlp + mu)，冻结；style_residual + slider_encoder 可训
+            # 设计：SliderEncoder 放 network（非 env），optimizer 自动收 style 参数；
+            #   W3 用固定 aaa_style_label buffer，无需 env/runner 改动；
+            #   W4 起 runner 经 obs_dict['slider'] 传 6 维 raw label，network 内编码。
             self.style_enabled = True
             _aaa_obs_dim = self.actor_mlp[0].in_features   # 945 (no cnn)
             _aaa_act_dim = self.mu.out_features             # 69
+            self.slider_encoder = SliderEncoder(slider_dim=6, latent_dim=32)
             self.style_residual = StyleResidual(
                 obs_dim=_aaa_obs_dim, z_style_dim=32, action_dim=_aaa_act_dim)
             self.style_alpha = self.style_residual.style_alpha  # 暴露给 optimizer
+            self.register_buffer('aaa_style_label', torch.zeros(1, 6))  # W3 固定 style 0
             for _p in self.actor_mlp.parameters(): _p.requires_grad_(False)
             for _p in self.mu.parameters():         _p.requires_grad_(False)
             # === AAA end ===
@@ -155,8 +161,12 @@ class AMPBuilder(network_builder.A2CBuilder):
                     mu = self.mu_act(self.mu(a_out))
                     # === AAA: bounded style residual ===
                     # mu_style = mu_base + α·tanh(Δπ(s, z_style)); α init=0
-                    _aaa_z = obs_dict.get('z_style', None)
-                    if self.style_enabled and _aaa_z is not None:
+                    # W3: obs_dict 无 'slider' 时用固定 aaa_style_label；W4 起 runner 传 raw slider
+                    if self.style_enabled:
+                        _aaa_slider = obs_dict.get('slider', None)
+                        if _aaa_slider is None:
+                            _aaa_slider = self.aaa_style_label.expand(obs.shape[0], -1)
+                        _aaa_z = self.slider_encoder(_aaa_slider)
                         _aaa_res = self.style_residual(obs, _aaa_z)
                         mu = mu + self.style_alpha * torch.tanh(_aaa_res)
                     # === AAA end ===
