@@ -171,7 +171,13 @@ class AMPBuilder(network_builder.A2CBuilder):
                             _aaa_slider = self.aaa_style_label.expand(obs.shape[0], -1)
                         _aaa_z = self.slider_encoder(_aaa_slider)
                         _aaa_res = self.style_residual(obs, _aaa_z)
-                        mu = mu + self.style_alpha * torch.tanh(_aaa_res)
+                        _aaa_delta = self.style_alpha * torch.tanh(_aaa_res)  # Δa = α·tanh(Δπ)
+                        mu = mu + _aaa_delta
+                        # === AAA W4: 缓存 Δa 供 residual norm 惩罚（w4 patch §8.3）===
+                        # 为什么：bounded 双保险的 norm 惩罚需精确 ‖Δa‖²（非 action proxy），W6 不用返工。
+                        #   play_steps 取此缓存算 ‖Δa‖² 进 experience_buffer，reward 合并时减 λ_res·‖Δa‖²。
+                        self._last_delta_a = _aaa_delta  # (B, 69)，play_steps 在 no_grad 下读取
+                        # === AAA end ===
                     # === AAA end ===
                     if self.space_config['fixed_sigma']:
                         sigma = mu * 0.0 + self.sigma_act(self.sigma)

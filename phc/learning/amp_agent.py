@@ -297,8 +297,13 @@ class AMPAgent(common_agent.CommonAgent):
         mb_rewards = self.experience_buffer.tensor_dict['rewards']
         mb_amp_obs = self.experience_buffer.tensor_dict['amp_obs']
         mb_slider = self.experience_buffer.tensor_dict['slider']  # AAA W4: 取 slider 喂 conditional disc（reward 路径）
+        mb_res_pen = self.experience_buffer.tensor_dict['res_penalty']  # AAA W4: ‖Δa‖²（residual norm 惩罚）
         amp_rewards = self._calc_amp_rewards(mb_amp_obs, mb_slider)
         mb_rewards = self._combine_rewards(mb_rewards, amp_rewards)
+        # === AAA W4: residual norm 惩罚 −λ_res·‖Δa‖²（tanh 硬界双保险，w4 patch §8.3 / 抉择2）===
+        # 为什么：bounded 结构的软约束补充——tanh 硬界限 Δa∈[−α,α]，norm 惩罚再加经济成本防 adapter 过偏。
+        mb_rewards = mb_rewards - self._res_lambda * mb_res_pen
+        # === AAA end ===
         
 
         mb_advs = self.discount_values(mb_fdones, mb_values, mb_rewards, mb_next_values)
@@ -359,6 +364,11 @@ class AMPAgent(common_agent.CommonAgent):
             self.experience_buffer.update_data('amp_obs', n, infos['amp_obs'])
             # === AAA W4: slider 同步进 buffer（仿 amp_obs，w4 patch §1.2）===
             self.experience_buffer.update_data('slider', n, infos['slider'])
+            # === AAA W4: residual norm 惩罚 ‖Δa‖²（w4 patch §8.3）===
+            # Δa = α·tanh(Δπ) 由 eval_actor 缓存在 _last_delta_a（对应当步 action），这里取算平方和存盘。
+            _aaa_delta = self.model.a2c_network._last_delta_a  # (num_envs, 69)
+            _aaa_res_pen = (_aaa_delta ** 2).sum(dim=-1, keepdim=True)  # (num_envs, 1)
+            self.experience_buffer.update_data('res_penalty', n, _aaa_res_pen)
             # === AAA end ===
 
                 
@@ -401,8 +411,13 @@ class AMPAgent(common_agent.CommonAgent):
         mb_rewards = self.experience_buffer.tensor_dict['rewards']
         mb_amp_obs = self.experience_buffer.tensor_dict['amp_obs']
         mb_slider = self.experience_buffer.tensor_dict['slider']  # AAA W4: 取 slider 喂 conditional disc（reward 路径）
+        mb_res_pen = self.experience_buffer.tensor_dict['res_penalty']  # AAA W4: ‖Δa‖²（residual norm 惩罚）
         amp_rewards = self._calc_amp_rewards(mb_amp_obs, mb_slider)
         mb_rewards = self._combine_rewards(mb_rewards, amp_rewards)
+        # === AAA W4: residual norm 惩罚 −λ_res·‖Δa‖²（tanh 硬界双保险，w4 patch §8.3 / 抉择2）===
+        # 为什么：bounded 结构的软约束补充——tanh 硬界限 Δa∈[−α,α]，norm 惩罚再加经济成本防 adapter 过偏。
+        mb_rewards = mb_rewards - self._res_lambda * mb_res_pen
+        # === AAA end ===
         mb_advs = self.discount_values(mb_fdones, mb_values, mb_rewards, mb_next_values)
         mb_returns = mb_advs + mb_values
 
@@ -860,6 +875,11 @@ class AMPAgent(common_agent.CommonAgent):
         #   训练时取 mb_slider 喂 conditional disc（reward 路径）+ minibatch 喂 disc（训练路径）。
         #   加进 tensor_list 使 play_steps 的 get_transformed_list 把 slider 塞进 batch_dict（供 replay 存盘）。
         self.experience_buffer.tensor_dict['slider'] = torch.zeros(batch_shape + (6,), device=self.ppo_device)
+        # === AAA W4: res_penalty buffer（‖Δa‖²，w4 patch §8.3）===
+        # 为什么：存每步 ‖Δa‖² 供 reward 合并时减 λ_res·‖Δa‖²（tanh 硬界双保险的 norm 惩罚，抉择2）。
+        #   Δa 由 eval_actor 缓存（network 侧 _last_delta_a），play_steps 取算。shape (num_envs, horizon, 1) 对齐 rewards。
+        self.experience_buffer.tensor_dict['res_penalty'] = torch.zeros(batch_shape + (1,), device=self.ppo_device)
+        self._res_lambda = float(self.config.get('res_lambda', 0.001))  # λ_res，默认 0.001 起步（可 config 覆盖）
         # === AAA end ===
         amp_obs_demo_buffer_size = int(self.config['amp_obs_demo_buffer_size'])
         self._amp_obs_demo_buffer = replay_buffer.ReplayBuffer(amp_obs_demo_buffer_size, self.ppo_device)  # Demo is the data from the dataset. Real samples
