@@ -1,5 +1,8 @@
 
-*.json
+# NOTE: 原 PHC 用裸 `*.json` 忽略所有 json。
+# 我们要用 git 传实验数据（含 metrics.json 等小文件），故改为只忽略
+# 数据型 json（AMASS/mocap 元数据），放开 config/metrics 类 json。
+data/**/*.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -128,20 +131,34 @@ venv.bak/
 
  # Pyre type checker
 .pyre/
-checkpoints/
-data/*
-output/
-log/
 
-*.png
-*.jpg
+# === 权重 / 大数据：不传 git（太大），用 rsync / 云盘单独存 ===
+checkpoints/
+*.pt
+*.pkl
+*.ckpt
+# AMASS / mocap 等大数据目录（PHC 下载到 sample_data/；amass 仓库另放）
+sample_data/
+# 注意：data/* 已删除——它会误伤 phc/data/cfg/ 和 phc/data/assets/（这些要传）。
+# 如有大数据子目录需忽略，在此精确列出（例：data/amass/）。
+data/amass/
+data/raw/
+
+# === 实验输出目录：放开（原 PHC 忽略 output/ log/ out/，我们要用 git 传实验数据）===
+# output/ 由 PHC 用作训练输出 + 预训练 checkpoint 落地，其中 .pt/.pkl 已被上面忽略，
+# 其余 config 副本 / metrics / 日志等小文件允许提交。
+# （如需排除 output 下的某些子目录，在此精确列出。）
+
+# 日志文件（按文件名忽略，目录放开）
+*.log
 stageroom_train/ # tensorboard log
 trials/
-output_videos/
-*.pkl
-*.pt
 new_trials
+
+# 图片 / 视频：默认不传（体积大，走 rsync）；如需提交 demo 截图可注释掉
+*.png
+*.jpg
+*.mp4
+*.gif
+
 gh-md-toc
-# AAA repro
-*.bak
-repro_logs/
