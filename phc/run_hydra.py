@@ -334,6 +334,16 @@ def main(cfg_hydra: DictConfig) -> None:
     runner = build_alg_runner(algo_observer)
     runner.load(cfg_train)
     runner.reset()
+
+    # === AAA W4: 第二步「3-5 风格可区分」验收 sweep 入口（w4 patch §8.8）===
+    # 为什么：im_eval run() 按 138 motion 切片不兼容"固定单 motion+多 slider"，故 cfg.aaa_w4_sweep=True
+    #   时改走轻量自定义 sweep（phc/learning/aaa_w4_style_sweep.py），不进训练/player.run()。
+    # 做什么：cfg 带 aaa_w4_sweep 标志时调 run_sweep 后直接返回；否则原 runner.run(cfg) 不变（零回归）。
+    if cfg.get("aaa_w4_sweep", False):
+        from learning.aaa_w4_style_sweep import run_sweep
+        run_sweep(runner, cfg)
+        return
+
     runner.run(cfg)
 
     return
