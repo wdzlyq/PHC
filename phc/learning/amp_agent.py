@@ -7,6 +7,7 @@ from rl_games.common import vecenv
 from isaacgym.torch_utils import *
 
 import time
+import os
 from datetime import datetime
 import numpy as np
 from torch import optim
@@ -332,6 +333,14 @@ class AMPAgent(common_agent.CommonAgent):
         mb_res_pen = self.experience_buffer.tensor_dict['res_penalty']  # AAA W4: ‖Δa‖²（residual norm 惩罚）
         amp_rewards = self._calc_amp_rewards(mb_amp_obs, mb_slider)
         mb_rewards = self._combine_rewards(mb_rewards, amp_rewards)
+        # === AAA probe: 记录三分量 reward 均值（gated by AAA_PROBE 环境变量，零回归）===
+        # 为什么：W4 第二步诊断 α 卡住，需看 content/disc/respen 三力各自量级 + α 净梯度方向。
+        # 做什么：combine 后 original task reward 已被覆盖，从 buffer 取；disc/respen 仍在作用域。
+        if os.environ.get('AAA_PROBE'):
+            self._probe_r_content = float(self.experience_buffer.tensor_dict['rewards'].mean())
+            self._probe_r_disc = float(amp_rewards['disc_rewards'].mean())
+            self._probe_r_respen = float(mb_res_pen.mean())
+        # === AAA end ===
         # === AAA W4: residual norm 惩罚 −λ_res·‖Δa‖²（tanh 硬界双保险，w4 patch §8.3 / 抉择2）===
         # 为什么：bounded 结构的软约束补充——tanh 硬界限 Δa∈[−α,α]，norm 惩罚再加经济成本防 adapter 过偏。
         mb_rewards = mb_rewards - self._res_lambda * mb_res_pen
@@ -446,6 +455,14 @@ class AMPAgent(common_agent.CommonAgent):
         mb_res_pen = self.experience_buffer.tensor_dict['res_penalty']  # AAA W4: ‖Δa‖²（residual norm 惩罚）
         amp_rewards = self._calc_amp_rewards(mb_amp_obs, mb_slider)
         mb_rewards = self._combine_rewards(mb_rewards, amp_rewards)
+        # === AAA probe: 记录三分量 reward 均值（gated by AAA_PROBE 环境变量，零回归）===
+        # 为什么：W4 第二步诊断 α 卡住，需看 content/disc/respen 三力各自量级 + α 净梯度方向。
+        # 做什么：combine 后 original task reward 已被覆盖，从 buffer 取；disc/respen 仍在作用域。
+        if os.environ.get('AAA_PROBE'):
+            self._probe_r_content = float(self.experience_buffer.tensor_dict['rewards'].mean())
+            self._probe_r_disc = float(amp_rewards['disc_rewards'].mean())
+            self._probe_r_respen = float(mb_res_pen.mean())
+        # === AAA end ===
         # === AAA W4: residual norm 惩罚 −λ_res·‖Δa‖²（tanh 硬界双保险，w4 patch §8.3 / 抉择2）===
         # 为什么：bounded 结构的软约束补充——tanh 硬界限 Δa∈[−α,α]，norm 惩罚再加经济成本防 adapter 过偏。
         mb_rewards = mb_rewards - self._res_lambda * mb_res_pen
@@ -582,6 +599,18 @@ class AMPAgent(common_agent.CommonAgent):
         train_info['returns'] = batch_dict['returns']
         self._record_train_batch_info(batch_dict, train_info)
         self.post_epoch(self.epoch_num)
+        # === AAA probe: 每 epoch 打印 α 值 + α 净梯度 + 三分量 reward 均值（gated，零回归）===
+        # 为什么：α 卡 -0.026，需确认是哪股力主导。grad=最后 minibatch 的 PPO 净梯度（含三力），
+        #   sign 持续为负→被压向 0；≈0→无方向性杠杆。配合 disc-only run 隔离 force 3。
+        if os.environ.get('AAA_PROBE'):
+            _sa = self.model.a2c_network.style_alpha
+            _g = _sa.grad
+            _gv = float(_g.item()) if (_g is not None) else float('nan')
+            print(f'[AAA probe] Ep{self.epoch_num} alpha={_sa.item():+.5f} grad={_gv:+.3e} '
+                  f'r_content={getattr(self,"_probe_r_content",float("nan")):.4f} '
+                  f'r_disc={getattr(self,"_probe_r_disc",float("nan")):.4f} '
+                  f'r_respen={getattr(self,"_probe_r_respen",float("nan")):.4f}', flush=True)
+        # === AAA end ===
         
         return train_info
 

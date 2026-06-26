@@ -99,6 +99,15 @@ def run_sweep(runner, cfg):
     player.is_determenistic = True
     player.env.is_tensor_obses = True  # IM 训练用 tensor obs
 
+    # === AAA W4 probe: 强制 α（monkeypatch style_alpha）测"放大 α 是否产生 slider-dependent 风格"===
+    # 为什么：disc-only 证实 disc 有杠杆（α 增长、r_disc 升），但可能只是 tracking correction 非 style。
+    #   故强制把 α 拉到大幅值，sweep 看 slider 切换是否改变动作指标——若变→架构能产风格(方案A)，不变→residual 不编码风格(方案B/C)。
+    force_alpha = cfg.get('aaa_w4_force_alpha', None)
+    if force_alpha is not None:
+        sa = player.model.a2c_network.style_alpha
+        sa.data.fill_(float(force_alpha))
+        print(f"[AAA W4 sweep] ⚠️ forced style_alpha = {float(force_alpha)} (was {sa.item() if sa.numel()==1 else '?'})")
+
     env_task = player.env.task
     device = player.device
     num_envs = env_task.num_envs
