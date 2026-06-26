@@ -615,6 +615,34 @@ class AMPAgent(common_agent.CommonAgent):
         return train_info
 
     def pre_epoch(self, epoch_num):
+        # === AAA 方案A v2: α schedule + clamp（gated by AAA_ALPHA_MODE，默认 none 零回归）===
+        # 为什么：disc 探针定因——自然平衡 α~0.02 太小（content+respen 压制 + disc 杠杆自限），
+        #   风格显现需 |α|~0.3；forced-α=-0.3 sweep 已证架构能产可控风格（step_width +139%、
+        #   elbow_rom +52%）。但方案A从 phc_p1_extracted 重训时 residual 是 fresh init（gain 1e-3），
+        #   直接大 α = 大随机扰动 → destabilize，故先 ramp 0→target 让 residual 学映射再放大；
+        #   ramp 结束后 clamp 下界锁 |α|≥clamp，防被 content 拉回 0.02（探针观测到的失败模式）。
+        # 做什么：每 epoch 开头按 mode 调 style_alpha.data。
+        #   none（默认）=不干预，smoke/w3 零回归；schedule=ramp+clamp（方案A 重训用）。
+        #   ramp 期覆盖 α.data 会抹掉 PPO 上一 epoch 的 α 更新——这是 schedule 本意（强制轨迹）；
+        #   PPO 的 Adam m/v 不受影响，grad 继续反传，ramp 结束后 PPO 自由推（仅受 clamp 下界约束）。
+        _alpha_mode = os.environ.get('AAA_ALPHA_MODE', 'none')
+        if _alpha_mode == 'schedule' and hasattr(self.model, 'a2c_network') \
+                and hasattr(self.model.a2c_network, 'style_alpha'):
+            _sa = self.model.a2c_network.style_alpha
+            _target = float(os.environ.get('AAA_ALPHA_TARGET', '-0.3'))
+            _ramp_ep = int(os.environ.get('AAA_ALPHA_RAMP_EP', '50'))
+            _clamp = float(os.environ.get('AAA_ALPHA_CLAMP', '0.2'))
+            if _ramp_ep > 0 and epoch_num <= _ramp_ep:
+                # 线性 ramp 0 → target（epoch 0 → 0，epoch ramp_ep → target）
+                _sa.data.fill_(_target * (epoch_num / _ramp_ep))
+            else:
+                # ramp 结束后只锁下界 |α|≥clamp（符号跟随 target），PPO 自由推
+                if _target < 0:
+                    _sa.data.clamp_(max=-_clamp)   # α ≤ -clamp（负方向 |α|≥clamp）
+                else:
+                    _sa.data.clamp_(min=_clamp)
+        # === AAA end ===
+
         # print("freeze running mean/std")
 
         if self.vec_env.env.task.humanoid_type in ["smpl", "smplh", "smplx"]:

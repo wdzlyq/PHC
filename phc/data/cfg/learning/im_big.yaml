@@ -90,8 +90,9 @@ params:
     disc_weight_decay: 0.0001
     normalize_amp_input: True
 
-    task_reward_w: 0.7  # AAA W4: content 优先（抉择2，w4 patch §8.1）；disc 改 conditional 后 disc_reward_w 即 w_style
-    disc_reward_w: 0.3  # AAA W4: 风格 reward 权重 0.3 起步
+    task_reward_w: 0.5  # AAA 方案A v2: content 0.5（保 tracking，抉择2）；disc 改 conditional 后 disc_reward_w 即 w_style
+    disc_reward_w: 0.5  # AAA 方案A v2: 风格 reward 权重 0.3→0.5（增强 disc 杠杆力③，探针定因后）
+    res_lambda: 0.0     # AAA 方案A v2: 去掉 residual norm 惩罚力①（探针证它本就 tiny 且压制 α；tanh 硬界已足够 bounded）
 
     player: 
         games_num: 50000000
