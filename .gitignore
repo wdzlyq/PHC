@@ -162,3 +162,11 @@ new_trials
 *.gif
 
 gh-md-toc
+# === AAA: 大产物 / 本地镜像不进 PHC git（master_plan 两层 git 关系）===
+# output/ = 训练 checkpoint（2.9G+），data/ 已按需忽略 json/pkl，aaa_w3/ = code/ 的 scp 镜像，
+# repro_logs/ = 复现日志，*.bak = 服务器侧备份。这些只在服务器存在，正式代码以 phc/ 副本进 git。
+output/
+aaa_w3/
+repro_logs/
+*.bak
+# === AAA end ===
