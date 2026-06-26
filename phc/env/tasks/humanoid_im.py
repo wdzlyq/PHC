@@ -984,7 +984,11 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
         # === AAA W4: reset 时按新 motion_id 同步风格 slider（w4 patch §1.1）===
         # 为什么：env reset 换 motion 后，slider 必须同步换成新 motion 的风格，否则 conditional disc 条件错配。
         #   super()（humanoid_amp.py:525）已设好 _sampled_motion_ids[env_ids]，这里直接查 _style_table。
-        self.style_labels[env_ids] = self._style_table[self._sampled_motion_ids[env_ids]]
+        # ⚠️ 取模：IM 训练模式 _sampled_motion_ids = arange(num_envs)（env→motion 固定映射，值可 ≥ num_motions），
+        #   motion_lib 内部用 remainder(motion_id, _num_unique_motions) 取模映射（motion_lib_base.py:210）。
+        #   故 slider 索引必须同样 % num_unique_motions，否则 motion_id=1023 > 138 越界（W4 验收首跑崩点）。
+        _mid = self._sampled_motion_ids[env_ids] % self._motion_lib._num_unique_motions
+        self.style_labels[env_ids] = self._style_table[_mid]
         # === AAA end ===
         # self._motion_lib.update_sampling_history(env_ids)
 

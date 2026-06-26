@@ -229,7 +229,11 @@ class HumanoidAMP(Humanoid):
         # === AAA W4: demo 带对应 clip 的 slider（w4 patch §3）===
         # 为什么：conditional disc 的 demo 必须带对应 clip 的风格 slider，否则 disc 学不出"风格→动作"条件映射
         #   （MultiAct 警告：条件信号被忽略，w4 patch §6）。motion_ids 即 _style_table 下标，与 env 侧 style_labels 同表。
-        demo_slider = self._style_table[motion_ids]  # (num_samples, 6)
+        # ⚠️ 取模：sample_motions 用 _sampling_batch_prob（长度=num_envs=1024，非138）采样，motion_ids ∈ [0,1024)。
+        #   motion_lib 内部 motion_id i → unique i%138（_curr_motion_ids=remainder(arange,138)，motion_lib_base.py:210），
+        #   motion_lib 张量按 1024 slot 建故 motion_id<1024 合法（W3 能跑），但 _style_table 只有 138 行 → 必须 % 138。
+        #   与 env 侧 _reset_ref_state_init 的取模一致。
+        demo_slider = self._style_table[motion_ids % self._motion_lib._num_unique_motions]  # (num_samples, 6)
         # === AAA end ===
 
         return amp_obs_demo_flat, demo_slider

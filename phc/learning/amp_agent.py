@@ -673,9 +673,11 @@ class AMPAgent(common_agent.CommonAgent):
             'prev_actions': actions_batch, 'obs': obs_batch_processed, 'amp_obs': amp_obs, 'amp_obs_replay': amp_obs_replay, 'amp_obs_demo': amp_obs_demo, \
                 "obs_orig": obs_batch,
                 # === AAA W4: 三路 slider 传给 model forward → conditional disc（amp_models.py）===
+                # disc 的 slider 切到 _amp_minibatch_size(4096) 对齐 amp_obs；policy 的 slider 必须对齐
+                # obs_batch(minibatch_size=16384，与 amp_minibatch_size 不同)，故用全量 input_dict['slider']。
                 'amp_slider': amp_slider, 'amp_replay_slider': amp_replay_slider, 'demo_slider': demo_slider,
-                # AAA W4: policy eval_actor 用 'slider' key（style_residual 条件化），与 get_action_values 注入一致
-                'slider': amp_slider,
+                # AAA W4: policy eval_actor 用 'slider' key（style_residual 条件化），对齐 obs_batch 行数（全量，不切 amp_minibatch）
+                'slider': input_dict['slider'],
                 # === AAA end ===
                 }
     
