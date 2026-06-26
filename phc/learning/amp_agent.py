@@ -178,7 +178,39 @@ class AMPAgent(common_agent.CommonAgent):
             state['disc_reward_mean_std'] = self._disc_reward_mean_std.state_dict()
 
         return state
-    
+
+    def get_action_values(self, obs):
+        # === AAA W4: 注入当前 slider 给 policy eval_actor（style_residual 条件化，w4 patch 补漏）===
+        # 为什么：common_agent.get_action_values 的 input_dict 不透传 obs 额外 key，policy eval_actor
+        #   拿不到 slider → style_residual 用固定 style 0 → policy 学不到风格（W4 核心）。
+        #   故 override 此处注入。slider 来源 = env.style_labels（reset 时已按 motion 更新，
+        #   play_steps/play_steps_rnn 调用时即是当前步风格，与 infos['slider'] 同源）。
+        obs_orig = obs['obs']
+        processed_obs = self._preproc_obs(obs['obs'])
+        self.model.eval()
+        input_dict = {
+            'is_train': False,
+            'prev_actions': None,
+            'obs': processed_obs,
+            "obs_orig": obs_orig,
+            'rnn_states': self.rnn_states
+        }
+        if getattr(self.model.a2c_network, 'style_enabled', False):
+            input_dict['slider'] = self.vec_env.env.task.style_labels  # (num_envs, 6)
+        # === AAA end ===
+        with torch.no_grad():
+            res_dict = self.model(input_dict)
+            if self.has_central_value:
+                states = obs['states']
+                cv_input = {
+                    'is_train': False,
+                    'states': states,
+                }
+                value = self.get_central_value(cv_input)
+                res_dict['values'] = value
+        if self.normalize_value:
+            res_dict['values'] = self.value_mean_std(res_dict['values'], True)
+        return res_dict
 
     def play_steps_rnn(self):
         self.set_eval()
@@ -642,6 +674,8 @@ class AMPAgent(common_agent.CommonAgent):
                 "obs_orig": obs_batch,
                 # === AAA W4: 三路 slider 传给 model forward → conditional disc（amp_models.py）===
                 'amp_slider': amp_slider, 'amp_replay_slider': amp_replay_slider, 'demo_slider': demo_slider,
+                # AAA W4: policy eval_actor 用 'slider' key（style_residual 条件化），与 get_action_values 注入一致
+                'slider': amp_slider,
                 # === AAA end ===
                 }
     
