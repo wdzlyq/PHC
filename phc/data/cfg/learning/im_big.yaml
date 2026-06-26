@@ -90,8 +90,8 @@ params:
     disc_weight_decay: 0.0001
     normalize_amp_input: True
 
-    task_reward_w: 0.5
-    disc_reward_w: 0.5
+    task_reward_w: 0.7  # AAA W4: content 优先（抉择2，w4 patch §8.1）；disc 改 conditional 后 disc_reward_w 即 w_style
+    disc_reward_w: 0.3  # AAA W4: 风格 reward 权重 0.3 起步
 
     player: 
         games_num: 50000000

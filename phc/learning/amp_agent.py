@@ -243,6 +243,9 @@ class AMPAgent(common_agent.CommonAgent):
             self.experience_buffer.update_data_rnn('next_obses', indices, play_mask, self.obs['obs'])
             self.experience_buffer.update_data_rnn('dones', indices, play_mask, self.dones.byte())
             self.experience_buffer.update_data_rnn('amp_obs', indices, play_mask, infos['amp_obs'])
+            # === AAA W4: slider 同步进 RNN buffer（前向兼容，im_big 非 RNN 不走此路）===
+            self.experience_buffer.update_data_rnn('slider', indices, play_mask, infos['slider'])
+            # === AAA end ===
 
             ### ZL
             terminated = infos['terminate'].float()
@@ -293,7 +296,8 @@ class AMPAgent(common_agent.CommonAgent):
 
         mb_rewards = self.experience_buffer.tensor_dict['rewards']
         mb_amp_obs = self.experience_buffer.tensor_dict['amp_obs']
-        amp_rewards = self._calc_amp_rewards(mb_amp_obs)
+        mb_slider = self.experience_buffer.tensor_dict['slider']  # AAA W4: 取 slider 喂 conditional disc（reward 路径）
+        amp_rewards = self._calc_amp_rewards(mb_amp_obs, mb_slider)
         mb_rewards = self._combine_rewards(mb_rewards, amp_rewards)
         
 
@@ -353,6 +357,9 @@ class AMPAgent(common_agent.CommonAgent):
             self.experience_buffer.update_data('next_obses', n, self.obs['obs'])
             self.experience_buffer.update_data('dones', n, self.dones)
             self.experience_buffer.update_data('amp_obs', n, infos['amp_obs'])
+            # === AAA W4: slider 同步进 buffer（仿 amp_obs，w4 patch §1.2）===
+            self.experience_buffer.update_data('slider', n, infos['slider'])
+            # === AAA end ===
 
                 
             terminated = infos['terminate'].float()
@@ -393,7 +400,8 @@ class AMPAgent(common_agent.CommonAgent):
 
         mb_rewards = self.experience_buffer.tensor_dict['rewards']
         mb_amp_obs = self.experience_buffer.tensor_dict['amp_obs']
-        amp_rewards = self._calc_amp_rewards(mb_amp_obs)
+        mb_slider = self.experience_buffer.tensor_dict['slider']  # AAA W4: 取 slider 喂 conditional disc（reward 路径）
+        amp_rewards = self._calc_amp_rewards(mb_amp_obs, mb_slider)
         mb_rewards = self._combine_rewards(mb_rewards, amp_rewards)
         mb_advs = self.discount_values(mb_fdones, mb_values, mb_rewards, mb_next_values)
         mb_returns = mb_advs + mb_values
@@ -417,6 +425,11 @@ class AMPAgent(common_agent.CommonAgent):
         dataset_dict['amp_obs'] = batch_dict['amp_obs']
         dataset_dict['amp_obs_demo'] = batch_dict['amp_obs_demo']
         dataset_dict['amp_obs_replay'] = batch_dict['amp_obs_replay']
+        # === AAA W4: 三路 slider 进 dataset，供 minibatch 切片喂 conditional disc ===
+        dataset_dict['slider'] = batch_dict['slider']                      # agent 分支
+        dataset_dict['demo_slider'] = batch_dict['demo_slider']            # demo 分支
+        dataset_dict['amp_replay_slider'] = batch_dict['amp_replay_slider']  # replay 分支
+        # === AAA end ===
 
             
         self.dataset.update_values_dict(dataset_dict, rnn_format = True, horizon_length = self.horizon_length, num_envs = self.num_actors)
@@ -442,13 +455,21 @@ class AMPAgent(common_agent.CommonAgent):
 
         self._update_amp_demos()
         num_obs_samples = batch_dict['amp_obs'].shape[0]
-        amp_obs_demo = self._amp_obs_demo_buffer.sample(num_obs_samples)['amp_obs']
-        batch_dict['amp_obs_demo'] = amp_obs_demo
+        # === AAA W4: demo 取 amp_obs + slider（w4 patch §3）===
+        _demo_sampled = self._amp_obs_demo_buffer.sample(num_obs_samples)
+        batch_dict['amp_obs_demo'] = _demo_sampled['amp_obs']
+        batch_dict['demo_slider'] = _demo_sampled['slider']
+        # === AAA end ===
 
         if (self._amp_replay_buffer.get_total_count() == 0):
             batch_dict['amp_obs_replay'] = batch_dict['amp_obs']
+            batch_dict['amp_replay_slider'] = batch_dict['slider']  # AAA W4: 首次无 replay，用当步 slider
         else:
-            batch_dict['amp_obs_replay'] = self._amp_replay_buffer.sample(num_obs_samples)['amp_obs']
+            # === AAA W4: replay 取 amp_obs + slider（保证 replay 分支条件化正确）===
+            _replay_sampled = self._amp_replay_buffer.sample(num_obs_samples)
+            batch_dict['amp_obs_replay'] = _replay_sampled['amp_obs']
+            batch_dict['amp_replay_slider'] = _replay_sampled['slider']
+            # === AAA end ===
 
         self.set_train()
 
@@ -503,7 +524,7 @@ class AMPAgent(common_agent.CommonAgent):
         update_time = update_time_end - update_time_start
         total_time = update_time_end - play_time_start
 
-        self._store_replay_amp_obs(batch_dict['amp_obs'])
+        self._store_replay_amp_obs(batch_dict['amp_obs'], batch_dict['slider'])  # AAA W4: 同步存 slider
 
         train_info['play_time'] = play_time
         train_info['update_time'] = update_time
@@ -583,13 +604,16 @@ class AMPAgent(common_agent.CommonAgent):
 
         amp_obs = input_dict['amp_obs'][0:self._amp_minibatch_size]
         amp_obs = self._preproc_amp_obs(amp_obs)
-        
+        amp_slider = input_dict['slider'][0:self._amp_minibatch_size]  # AAA W4: agent 分支 slider
+
         amp_obs_replay = input_dict['amp_obs_replay'][0:self._amp_minibatch_size]
         amp_obs_replay = self._preproc_amp_obs(amp_obs_replay)
+        amp_replay_slider = input_dict['amp_replay_slider'][0:self._amp_minibatch_size]  # AAA W4: replay 分支 slider
 
         amp_obs_demo = input_dict['amp_obs_demo'][0:self._amp_minibatch_size]
         amp_obs_demo = self._preproc_amp_obs(amp_obs_demo)
         amp_obs_demo.requires_grad_(True)
+        demo_slider = input_dict['demo_slider'][0:self._amp_minibatch_size]  # AAA W4: demo 分支 slider
 
         lr = self.last_lr
         kl = 1.0
@@ -600,7 +624,10 @@ class AMPAgent(common_agent.CommonAgent):
         
         batch_dict = {'is_train': True, 'amp_steps': self.vec_env.env.task._num_amp_obs_steps, \
             'prev_actions': actions_batch, 'obs': obs_batch_processed, 'amp_obs': amp_obs, 'amp_obs_replay': amp_obs_replay, 'amp_obs_demo': amp_obs_demo, \
-                "obs_orig": obs_batch
+                "obs_orig": obs_batch,
+                # === AAA W4: 三路 slider 传给 model forward → conditional disc（amp_models.py）===
+                'amp_slider': amp_slider, 'amp_replay_slider': amp_replay_slider, 'demo_slider': demo_slider,
+                # === AAA end ===
                 }
     
         rnn_masks = None
@@ -820,12 +847,20 @@ class AMPAgent(common_agent.CommonAgent):
         return agent_acc, demo_acc
 
     def _fetch_amp_obs_demo(self, num_samples):
-        amp_obs_demo = self.vec_env.env.fetch_amp_obs_demo(num_samples)
-        return amp_obs_demo
+        # === AAA W4: env 返回 (amp_obs_demo, demo_slider)，透传 slider（w4 patch §3）===
+        amp_obs_demo, demo_slider = self.vec_env.env.fetch_amp_obs_demo(num_samples)
+        return amp_obs_demo, demo_slider
+        # === AAA end ===
 
     def _build_amp_buffers(self):
         batch_shape = self.experience_buffer.obs_base_shape
         self.experience_buffer.tensor_dict['amp_obs'] = torch.zeros(batch_shape + self._amp_observation_space.shape, device=self.ppo_device)
+        # === AAA W4: slider buffer（复用 amp_obs buffer 路径，w4 patch §1.2）===
+        # 为什么：slider 与 amp_obs 同形状前导（batch_shape），随 amp_obs 一起 update_data/swap_and_flatten，
+        #   训练时取 mb_slider 喂 conditional disc（reward 路径）+ minibatch 喂 disc（训练路径）。
+        #   加进 tensor_list 使 play_steps 的 get_transformed_list 把 slider 塞进 batch_dict（供 replay 存盘）。
+        self.experience_buffer.tensor_dict['slider'] = torch.zeros(batch_shape + (6,), device=self.ppo_device)
+        # === AAA end ===
         amp_obs_demo_buffer_size = int(self.config['amp_obs_demo_buffer_size'])
         self._amp_obs_demo_buffer = replay_buffer.ReplayBuffer(amp_obs_demo_buffer_size, self.ppo_device)  # Demo is the data from the dataset. Real samples
 
@@ -834,6 +869,7 @@ class AMPAgent(common_agent.CommonAgent):
         self._amp_replay_buffer = replay_buffer.ReplayBuffer(replay_buffer_size, self.ppo_device)
 
         self.tensor_list += ['amp_obs']
+        self.tensor_list += ['slider']  # AAA W4: slider 随 amp_obs 进 batch_dict
         return
 
     def _init_amp_demo_buf(self):
@@ -841,14 +877,18 @@ class AMPAgent(common_agent.CommonAgent):
         num_batches = int(np.ceil(buffer_size / self._amp_batch_size))
 
         for i in range(num_batches):
-            curr_samples = self._fetch_amp_obs_demo(self._amp_batch_size)
-            self._amp_obs_demo_buffer.store({'amp_obs': curr_samples})
+            # === AAA W4: demo buffer 同步存 slider（w4 patch §3）===
+            curr_samples, curr_slider = self._fetch_amp_obs_demo(self._amp_batch_size)
+            self._amp_obs_demo_buffer.store({'amp_obs': curr_samples, 'slider': curr_slider})
+            # === AAA end ===
 
         return
 
     def _update_amp_demos(self):
-        new_amp_obs_demo = self._fetch_amp_obs_demo(self._amp_batch_size)
-        self._amp_obs_demo_buffer.store({'amp_obs': new_amp_obs_demo})
+        # === AAA W4: demo buffer 同步存 slider ===
+        new_amp_obs_demo, new_demo_slider = self._fetch_amp_obs_demo(self._amp_batch_size)
+        self._amp_obs_demo_buffer.store({'amp_obs': new_amp_obs_demo, 'slider': new_demo_slider})
+        # === AAA end ===
         return
 
     def _norm_disc_reward(self):
@@ -866,18 +906,20 @@ class AMPAgent(common_agent.CommonAgent):
                          + self._disc_reward_w * disc_r
         return combined_rewards
 
-    def _eval_disc(self, amp_obs):
+    def _eval_disc(self, amp_obs, slider=None):
+        # AAA W4: 透传 slider 给 conditional disc（reward 路径）。amp_obs 在此 preproc，slider 保持 raw。
         proc_amp_obs = self._preproc_amp_obs(amp_obs)
-        return self.model.a2c_network.eval_disc(proc_amp_obs)
+        return self.model.a2c_network.eval_disc(proc_amp_obs, slider)
 
-    def _calc_amp_rewards(self, amp_obs):
-        disc_r = self._calc_disc_rewards(amp_obs)
+    def _calc_amp_rewards(self, amp_obs, slider=None):
+        # AAA W4: slider 透传到 disc reward 计算（w4 patch §2.3）。
+        disc_r = self._calc_disc_rewards(amp_obs, slider)
         output = {'disc_rewards': disc_r}
         return output
 
-    def _calc_disc_rewards(self, amp_obs):
+    def _calc_disc_rewards(self, amp_obs, slider=None):
         with torch.no_grad():
-            disc_logits = self._eval_disc(amp_obs)
+            disc_logits = self._eval_disc(amp_obs, slider)
             prob = 1 / (1 + torch.exp(-disc_logits))
             disc_r = -torch.log(torch.maximum(1 - prob, torch.tensor(0.0001, device=self.ppo_device)))
 
@@ -891,20 +933,30 @@ class AMPAgent(common_agent.CommonAgent):
 
         return disc_r
 
-    def _store_replay_amp_obs(self, amp_obs):
+    def _store_replay_amp_obs(self, amp_obs, slider=None):
+        # === AAA W4: replay buffer 同步存 slider，保证 replay 分支条件化正确（w4 patch §2.3）===
+        # 为什么：replay 存的是历史 agent amp_obs，其对应 slider 也必须原样存盘，否则 disc 用错配 slider 训练。
         buf_size = self._amp_replay_buffer.get_buffer_size()
         buf_total_count = self._amp_replay_buffer.get_total_count()
         if (buf_total_count > buf_size):
             keep_probs = to_torch(np.array([self._amp_replay_keep_prob] * amp_obs.shape[0]), device=self.ppo_device)
             keep_mask = torch.bernoulli(keep_probs) == 1.0
             amp_obs = amp_obs[keep_mask]
+            if slider is not None:
+                slider = slider[keep_mask]  # 同步过滤
 
         if (amp_obs.shape[0] > buf_size):
             rand_idx = torch.randperm(amp_obs.shape[0])
             rand_idx = rand_idx[:buf_size]
             amp_obs = amp_obs[rand_idx]
+            if slider is not None:
+                slider = slider[rand_idx]  # 同步过滤
 
-        self._amp_replay_buffer.store({'amp_obs': amp_obs})
+        store_dict = {'amp_obs': amp_obs}
+        if slider is not None:
+            store_dict['slider'] = slider
+        self._amp_replay_buffer.store(store_dict)
+        # === AAA end ===
         return
 
     def _record_train_batch_info(self, batch_dict, train_info):
@@ -954,8 +1006,13 @@ class AMPAgent(common_agent.CommonAgent):
         with torch.no_grad():
             amp_obs = info['amp_obs']
             amp_obs = amp_obs[0:1]
-            disc_pred = self._eval_disc(amp_obs)
-            amp_rewards = self._calc_amp_rewards(amp_obs)
+            # === AAA W4: debug 也带 slider（info 由 env extras 提供，key='slider'）===
+            dbg_slider = info.get('slider', None)
+            if dbg_slider is not None:
+                dbg_slider = dbg_slider[0:1]
+            disc_pred = self._eval_disc(amp_obs, dbg_slider)
+            amp_rewards = self._calc_amp_rewards(amp_obs, dbg_slider)
+            # === AAA end ===
             disc_reward = amp_rewards['disc_rewards']
 
             disc_pred = disc_pred.detach().cpu().numpy()[0, 0]

@@ -29,14 +29,22 @@ class ModelAMPContinuous(ModelA2CContinuousLogStd):
             
             if (is_train):
                 amp_obs, amp_obs_replay, amp_demo_obs = input_dict['amp_obs'],  input_dict['amp_obs_replay'], input_dict['amp_obs_demo']
-                
-                disc_agent_logit = self.a2c_network.eval_disc(amp_obs)
+                # === AAA W4: 三分支 disc 各带对应 slider（w4 patch §2.3）===
+                # 为什么：agent/replay/demo 三路 amp_obs 各自对应不同 slider，conditional disc 必须分别条件化：
+                #   agent 用当步 mb_slider，demo 用 demo_slider（clip 原生风格），replay 用存盘时的 slider。
+                #   缺失时 eval_disc 内部回落普通 disc（兼容非 AAA）。
+                amp_slider = input_dict.get('amp_slider', None)
+                amp_replay_slider = input_dict.get('amp_replay_slider', None)
+                demo_slider = input_dict.get('demo_slider', None)
+                # === AAA end ===
+
+                disc_agent_logit = self.a2c_network.eval_disc(amp_obs, amp_slider)
                 result["disc_agent_logit"] = disc_agent_logit
 
-                disc_agent_replay_logit = self.a2c_network.eval_disc(amp_obs_replay)
+                disc_agent_replay_logit = self.a2c_network.eval_disc(amp_obs_replay, amp_replay_slider)
                 result["disc_agent_replay_logit"] = disc_agent_replay_logit
 
-                disc_demo_logit = self.a2c_network.eval_disc(amp_demo_obs)
+                disc_demo_logit = self.a2c_network.eval_disc(amp_demo_obs, demo_slider)
                 result["disc_demo_logit"] = disc_demo_logit
 
                 # # HACK....

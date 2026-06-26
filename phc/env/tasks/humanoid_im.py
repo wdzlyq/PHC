@@ -98,7 +98,23 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
         #################### Devs ####################
 
         super().__init__(cfg=cfg, sim_params=sim_params, physics_engine=physics_engine, device_type=device_type, device_id=device_id, headless=headless)
-        
+
+        # === AAA W4: 风格 slider 表（env 侧数据源）===
+        # 为什么：conditional AMP 需要每个 env 当前 motion 的 6 维风格 slider 作风格信号（doc21 §4.2）。
+        #   slider 复用 amp_obs 的 extras→experience_buffer 路径（w4 patch §1），env 侧只负责"按 motion_id 查表"。
+        # 做什么：读 data/style/style_labels.csv（138 clip × 6 维，抉择7），按 motion_lib._motion_data_keys
+        #   顺序建 _style_table。关键：用 name→6维 字典查表，不按 csv 行序——im_eval 时 motion_lib 按长度
+        #   排序 key（motion_lib_base.py:150），行序会错位，必须 name 对齐（w4 patch §8.4 实测验证）。
+        #   style_labels 随 motion reset 重采样（见 _reset_ref_state_init）。
+        import pandas as pd
+        _sl_df = pd.read_csv("data/style/style_labels.csv")
+        _style_cols = ["energy", "step_width", "elbow_bend", "vert_bob", "cadence", "trunk_sway"]
+        _name2style = {row["clip"]: torch.tensor([row[c] for c in _style_cols], dtype=torch.float, device=self.device) for _, row in _sl_df.iterrows()}
+        _motion_keys = self._motion_lib._motion_data_keys  # np.array[str], 顺序 = motion_id 下标
+        self._style_table = torch.stack([_name2style[k] for k in _motion_keys], dim=0)  # (num_motions, 6)
+        self.style_labels = torch.zeros((self.num_envs, 6), device=self.device)  # 每 env 当前 slider，随 reset 更新
+        # === AAA end ===
+
         if self.humanoid_type in ['h1', 'g1', ]:
             self.actions = torch.zeros(self.num_envs, self._dof_obs_size).to(self.device) #### Keeping taps on previous actions
             
@@ -670,7 +686,13 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
 
     def post_physics_step(self):
         super().post_physics_step()
-        
+
+        # === AAA W4: slider 随 amp_obs 一起进 extras（复用 amp_obs buffer 路径，w4 patch §1.2）===
+        # 为什么：agent 侧从 infos['slider'] 取进 experience_buffer（仿 infos['amp_obs']，amp_agent.py:355），
+        #   不自造 threading。super().post_physics_step 已在此前设好 extras['amp_obs']，slider 同处塞入。
+        self.extras["slider"] = self.style_labels  # (num_envs, 6) raw slider
+        # === AAA end ===
+
         if flags.im_eval:
             motion_times = (self.progress_buf) * self.dt + self._motion_start_times + self._motion_start_times_offset  # already has time + 1, so don't need to + 1 to get the target for "this frame"
             motion_res = self._get_state_from_motionlib_cache(self._sampled_motion_ids, motion_times, self._global_offset)  # pass in the env_ids such that the motion is in synced.
@@ -959,6 +981,11 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
 
         self._cycle_counter[env_ids] = 0
         super()._reset_ref_state_init(env_ids)  # This function does not use the offset
+        # === AAA W4: reset 时按新 motion_id 同步风格 slider（w4 patch §1.1）===
+        # 为什么：env reset 换 motion 后，slider 必须同步换成新 motion 的风格，否则 conditional disc 条件错配。
+        #   super()（humanoid_amp.py:525）已设好 _sampled_motion_ids[env_ids]，这里直接查 _style_table。
+        self.style_labels[env_ids] = self._style_table[self._sampled_motion_ids[env_ids]]
+        # === AAA end ===
         # self._motion_lib.update_sampling_history(env_ids)
 
         if self.obs_v == 4:

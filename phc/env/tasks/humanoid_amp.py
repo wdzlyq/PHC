@@ -225,9 +225,14 @@ class HumanoidAMP(Humanoid):
         amp_obs_demo = self.build_amp_obs_demo(motion_ids, motion_times0)
         self._amp_obs_demo_buf[:] = amp_obs_demo.view(self._amp_obs_demo_buf.shape)
         amp_obs_demo_flat = self._amp_obs_demo_buf.view(-1, self.get_num_amp_obs())
-        
 
-        return amp_obs_demo_flat
+        # === AAA W4: demo 带对应 clip 的 slider（w4 patch §3）===
+        # 为什么：conditional disc 的 demo 必须带对应 clip 的风格 slider，否则 disc 学不出"风格→动作"条件映射
+        #   （MultiAct 警告：条件信号被忽略，w4 patch §6）。motion_ids 即 _style_table 下标，与 env 侧 style_labels 同表。
+        demo_slider = self._style_table[motion_ids]  # (num_samples, 6)
+        # === AAA end ===
+
+        return amp_obs_demo_flat, demo_slider
     
     def build_amp_obs_demo_steps(self, motion_ids, motion_times0, num_steps):
         dt = self.dt

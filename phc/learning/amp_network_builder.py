@@ -29,13 +29,14 @@ class AMPBuilder(network_builder.A2CBuilder):
                     sigma_init(self.sigma)
 
             amp_input_shape = kwargs.get('amp_input_shape')
-            self._build_disc(amp_input_shape)
 
             # === AAA: bounded style residual setup (W3) ===
             # base = 提取的单 primitive (actor_mlp + mu)，冻结；style_residual + slider_encoder 可训
             # 设计：SliderEncoder 放 network（非 env），optimizer 自动收 style 参数；
             #   W3 用固定 aaa_style_label buffer，无需 env/runner 改动；
             #   W4 起 runner 经 obs_dict['slider'] 传 6 维 raw label，network 内编码。
+            # ⚠️ 必须在 _build_disc 之前设 style_enabled=True：_build_disc 据 style_enabled 把 disc 输入
+            #   扩成 amp_obs_dim+32（w4 patch §2.1），顺序反了会导致 eval_disc cat z_style 后维度不匹配。
             self.style_enabled = True
             _aaa_obs_dim = self.actor_mlp[0].in_features   # 945 (no cnn)
             _aaa_act_dim = self.mu.out_features             # 69
@@ -47,6 +48,8 @@ class AMPBuilder(network_builder.A2CBuilder):
             for _p in self.actor_mlp.parameters(): _p.requires_grad_(False)
             for _p in self.mu.parameters():         _p.requires_grad_(False)
             # === AAA end ===
+
+            self._build_disc(amp_input_shape)
 
             return
 
@@ -240,8 +243,22 @@ class AMPBuilder(network_builder.A2CBuilder):
                 value = self.value_act(self.value(c_out))
                 return value
 
-        def eval_disc(self, amp_obs):
-            disc_mlp_out = self._disc_mlp(amp_obs)
+        def eval_disc(self, amp_obs, slider=None):
+            # === AAA W4: conditional disc（w4 patch §2.2）===
+            # 为什么：disc 输入拼 z_style 才能学到"风格→动作"条件映射（否则条件信号被忽略，MultiAct 警告，w4 patch §6）。
+            #   slider_encoder 与 policy style_residual 共享同一 encoder，保证风格信号一致（doc21 §4.2）。
+            #   amp_obs 已由调用方 _preproc_amp_obs 归一化，slider 保持 raw [0,1]（已归一化，不再 preproc）。
+            # 做什么：AAA 模式下 _build_disc 已把 disc 输入扩成 amp_obs_dim+32，故必须始终拼 z_style；
+            #   slider 为 None 时回落固定 style 0（aaa_style_label，与 W3 一致），保证维度对齐、零回归。
+            if getattr(self, 'style_enabled', False):
+                if slider is None:
+                    slider = self.aaa_style_label.expand(amp_obs.shape[0], -1)
+                z_style = self.slider_encoder(slider)           # (B, 32)
+                disc_in = torch.cat([amp_obs, z_style], dim=-1)
+            else:
+                disc_in = amp_obs
+            # === AAA end ===
+            disc_mlp_out = self._disc_mlp(disc_in)
             disc_logits = self._disc_logits(disc_mlp_out)
             return disc_logits
 
@@ -258,6 +275,11 @@ class AMPBuilder(network_builder.A2CBuilder):
             return weights
 
         def _build_disc(self, input_shape):
+            # === AAA W4: conditional disc 输入 = amp_obs ⊕ z_style(32)（w4 patch §2.1）===
+            # 为什么：disc 第一层 Linear 输入维 = amp_obs_dim + 32，与 eval_disc 的 cat 对齐。
+            if getattr(self, 'style_enabled', False):
+                input_shape = (input_shape[0] + 32,)
+            # === AAA end ===
             self._disc_mlp = nn.Sequential()
 
             mlp_args = {'input_size': input_shape[0], 'units': self._disc_units, 'activation': self._disc_activation, 'dense_func': torch.nn.Linear}
