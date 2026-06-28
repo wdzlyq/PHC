@@ -167,11 +167,7 @@ class AMPBuilder(network_builder.A2CBuilder):
                     # W3: obs_dict 无 'slider' 时用固定 aaa_style_label；W4 起 runner 传 raw slider
                     if self.style_enabled:
                         _aaa_slider = obs_dict.get('slider', None)
-                        if _aaa_slider is None:
-                            _aaa_slider = self.aaa_style_label.expand(obs.shape[0], -1)
-                        _aaa_z = self.slider_encoder(_aaa_slider)
-                        _aaa_res = self.style_residual(obs, _aaa_z)
-                        _aaa_delta = self.style_alpha * torch.tanh(_aaa_res)  # Δa = α·tanh(Δπ)
+                        _aaa_delta = self.eval_style_delta(obs, _aaa_slider)  # Δa = α·tanh(Δπ)
                         mu = mu + _aaa_delta
                         # === AAA W4: 缓存 Δa 供 residual norm 惩罚（w4 patch §8.3）===
                         # 为什么：bounded 双保险的 norm 惩罚需精确 ‖Δa‖²（非 action proxy），W6 不用返工。
@@ -188,6 +184,21 @@ class AMPBuilder(network_builder.A2CBuilder):
                     # return torch.round(mu, decimals=3), sigma
 
             return
+
+        def eval_style_delta(self, obs, slider=None, alpha_override=None):
+            # === AAA W5: style delta helper for residual contrast loss ===
+            # 为什么：C+ reward-shaping-only 失败的核心证据是同 obs 切 slider 时 Δa 仅 1.10% 变化。
+            #   train_minibatch 需要直接比较同一 obs 下不同 slider 的 Δa，给 adapter 一条可微的
+            #   "必须读 slider" 辅助信号；复用这里避免在 agent 侧复制 encoder/residual 细节。
+            # 做什么：返回 effective_delta = α_eff * tanh(residual(obs, slider))，默认 α_eff=style_alpha；
+            #   alpha_override 仅供 auxiliary loss 在 α 太小时给 residual 提供有效梯度，不改变 eval_actor 行为。
+            if slider is None:
+                slider = self.aaa_style_label.expand(obs.shape[0], -1)
+            z_style = self.slider_encoder(slider)
+            residual = self.style_residual(obs, z_style)
+            alpha = self.style_alpha if alpha_override is None else alpha_override
+            return alpha * torch.tanh(residual)
+            # === AAA end ===
         
         def get_actor_paramters(self):
             return list(self.actor_mlp.parameters()) + list(self.actor_cnn.parameters()) + list(self.mu.parameters()) 

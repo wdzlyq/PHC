@@ -103,5 +103,18 @@ params:
     aaa_cplus_target_range: 0.2
     # === AAA end ===
 
+    # === AAA W5: step_width-only 修正计划 loss 开关（默认关闭，零回归）===
+    # 为什么：C+ reward-shaping-only 失败后，下一轮需要两条更强信号：
+    #   1) style-specific PPO advantage，避免 r_style 被 content/disc 淹没；
+    #   2) residual contrast loss，直接强制 adapter 对 slider 敏感。
+    # 做什么：默认 0 不改变旧实验；canary 时命令行 override。
+    aaa_style_adv_coef: 0.0
+    aaa_contrast_coef: 0.0
+    aaa_contrast_delta_coef: 0.0
+    aaa_contrast_kl_coef: 0.0
+    aaa_contrast_alpha_floor: 0.1
+    aaa_contrast_dim: 1  # 0=energy, 1=step_width, 2=elbow_bend
+    # === AAA end ===
+
     player:
         games_num: 50000000

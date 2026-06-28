@@ -54,6 +54,19 @@ class AMPAgent(common_agent.CommonAgent):
 
         self.temp_running_mean = self.vec_env.env.task.temp_running_mean # use temp running mean to make sure the obs used for training is the same as calc gradient.
 
+        # === AAA W5: step_width canary loss switches (default off, zero-regression) ===
+        # 为什么：C+ reward-shaping-only 已证实 style reward 能计算但传不到 adapter；下一轮需要把
+        #   style reward 从总 reward 拆出独立 advantage，并用 residual contrast loss 显式打开
+        #   slider→style_residual 信息通道。默认全 0，保持旧 W4/W5 训练行为不变。
+        # 做什么：读取 loss 权重与 contrast 设置；实际 loss 在 calc_gradients gated 加入。
+        self._aaa_style_adv_coef = float(config.get('aaa_style_adv_coef', 0.0))
+        self._aaa_contrast_coef = float(config.get('aaa_contrast_coef', 0.0))
+        self._aaa_contrast_delta_coef = float(config.get('aaa_contrast_delta_coef', 0.0))
+        self._aaa_contrast_kl_coef = float(config.get('aaa_contrast_kl_coef', 0.0))
+        self._aaa_contrast_alpha_floor = float(config.get('aaa_contrast_alpha_floor', 0.1))
+        self._aaa_contrast_dim = int(config.get('aaa_contrast_dim', 1))  # step_width dim
+        # === AAA end ===
+
         kin_lr = float(self.vec_env.env.task.kin_lr)
         
         # ZL Hack
@@ -278,6 +291,16 @@ class AMPAgent(common_agent.CommonAgent):
             self.experience_buffer.update_data_rnn('amp_obs', indices, play_mask, infos['amp_obs'])
             # === AAA W4: slider 同步进 RNN buffer（前向兼容，im_big 非 RNN 不走此路）===
             self.experience_buffer.update_data_rnn('slider', indices, play_mask, infos['slider'])
+            # === AAA W5: C+ style reward 单独进 RNN buffer ===
+            # 为什么：style-specific PPO advantage 需要 env 侧 metric-anchored r_style 的原始序列；
+            #   RNN 路径虽非 im_big 主线，也保持 buffer 字段一致。
+            _aaa_style_reward = infos.get('aaa_cplus_style_reward', None)
+            if _aaa_style_reward is None:
+                _aaa_style_reward = torch.zeros_like(rewards)
+            if _aaa_style_reward.dim() == 1:
+                _aaa_style_reward = _aaa_style_reward.unsqueeze(-1)
+            self.experience_buffer.update_data_rnn('style_reward', indices, play_mask, _aaa_style_reward)
+            # === AAA end ===
             # === AAA end ===
 
             ### ZL
@@ -328,6 +351,7 @@ class AMPAgent(common_agent.CommonAgent):
         mb_next_values = self.experience_buffer.tensor_dict['next_values']
 
         mb_rewards = self.experience_buffer.tensor_dict['rewards']
+        mb_style_rewards = self.experience_buffer.tensor_dict['style_reward']
         mb_amp_obs = self.experience_buffer.tensor_dict['amp_obs']
         mb_slider = self.experience_buffer.tensor_dict['slider']  # AAA W4: 取 slider 喂 conditional disc（reward 路径）
         mb_res_pen = self.experience_buffer.tensor_dict['res_penalty']  # AAA W4: ‖Δa‖²（residual norm 惩罚）
@@ -349,10 +373,17 @@ class AMPAgent(common_agent.CommonAgent):
 
         mb_advs = self.discount_values(mb_fdones, mb_values, mb_rewards, mb_next_values)
         mb_returns = mb_advs + mb_values
+        # === AAA W5: style-specific advantage（无 critic baseline，默认 coef=0 时只记录不使用）===
+        # 为什么：C+ v2 说明 style reward 混在总 reward 中会被 content/disc 稀释；单独 GAE 后
+        #   calc_gradients 可用 aaa_style_adv_coef 加一条 style PPO actor loss。
+        _aaa_zero_values = torch.zeros_like(mb_values)
+        mb_style_advs = self.discount_values(mb_fdones, _aaa_zero_values, mb_style_rewards, _aaa_zero_values)
+        # === AAA end ===
         
         # self.experience_buffer.tensor_dict['actions']: is num_env, Batch, feat. That's why we swap and flatten, mb_rnn_states is already in that format. 
         batch_dict = self.experience_buffer.get_transformed_list(a2c_common.swap_and_flatten01, self.tensor_list) # swap to step, num_envs, feat
         batch_dict['returns'] = a2c_common.swap_and_flatten01(mb_returns)
+        batch_dict['style_advantages'] = a2c_common.swap_and_flatten01(mb_style_advs)
         batch_dict['rnn_states'] = mb_rnn_states
         
         batch_dict['rnn_masks'] = mb_rnn_masks # ZL: this should be swap and flattened, but it's all ones for now
@@ -367,6 +398,7 @@ class AMPAgent(common_agent.CommonAgent):
             batch_dict[k] = a2c_common.swap_and_flatten01(v)
 
         batch_dict['mb_rewards'] = a2c_common.swap_and_flatten01(mb_rewards)
+        batch_dict['style_rewards'] = a2c_common.swap_and_flatten01(mb_style_rewards)
         
         return batch_dict
 
@@ -405,6 +437,16 @@ class AMPAgent(common_agent.CommonAgent):
             self.experience_buffer.update_data('amp_obs', n, infos['amp_obs'])
             # === AAA W4: slider 同步进 buffer（仿 amp_obs，w4 patch §1.2）===
             self.experience_buffer.update_data('slider', n, infos['slider'])
+            # === AAA W5: C+ style reward 单独进 buffer ===
+            # 为什么：C+ v2 失败说明 style reward 混进总 reward 后被 content/disc 淹没；
+            #   单独保存 env 计算的 metric-anchored r_style，后面可构造独立 style advantage。
+            _aaa_style_reward = infos.get('aaa_cplus_style_reward', None)
+            if _aaa_style_reward is None:
+                _aaa_style_reward = torch.zeros_like(rewards)
+            if _aaa_style_reward.dim() == 1:
+                _aaa_style_reward = _aaa_style_reward.unsqueeze(-1)
+            self.experience_buffer.update_data('style_reward', n, _aaa_style_reward)
+            # === AAA end ===
             # === AAA W4: residual norm 惩罚 ‖Δa‖²（w4 patch §8.3）===
             # Δa = α·tanh(Δπ) 由 eval_actor 缓存在 _last_delta_a（对应当步 action），这里取算平方和存盘。
             _aaa_delta = self.model.a2c_network._last_delta_a  # (num_envs, 69)
@@ -450,6 +492,7 @@ class AMPAgent(common_agent.CommonAgent):
         mb_next_values = self.experience_buffer.tensor_dict['next_values']
 
         mb_rewards = self.experience_buffer.tensor_dict['rewards']
+        mb_style_rewards = self.experience_buffer.tensor_dict['style_reward']
         mb_amp_obs = self.experience_buffer.tensor_dict['amp_obs']
         mb_slider = self.experience_buffer.tensor_dict['slider']  # AAA W4: 取 slider 喂 conditional disc（reward 路径）
         mb_res_pen = self.experience_buffer.tensor_dict['res_penalty']  # AAA W4: ‖Δa‖²（residual norm 惩罚）
@@ -469,9 +512,16 @@ class AMPAgent(common_agent.CommonAgent):
         # === AAA end ===
         mb_advs = self.discount_values(mb_fdones, mb_values, mb_rewards, mb_next_values)
         mb_returns = mb_advs + mb_values
+        # === AAA W5: style-specific advantage（无 critic baseline，默认 coef=0 时只记录不使用）===
+        # 为什么：C+ v2 说明 style reward 混在总 reward 中会被 content/disc 稀释；单独 GAE 后
+        #   calc_gradients 可用 aaa_style_adv_coef 加一条 style PPO actor loss。
+        _aaa_zero_values = torch.zeros_like(mb_values)
+        mb_style_advs = self.discount_values(mb_fdones, _aaa_zero_values, mb_style_rewards, _aaa_zero_values)
+        # === AAA end ===
 
         batch_dict = self.experience_buffer.get_transformed_list(a2c_common.swap_and_flatten01, self.tensor_list)
         batch_dict['returns'] = a2c_common.swap_and_flatten01(mb_returns)
+        batch_dict['style_advantages'] = a2c_common.swap_and_flatten01(mb_style_advs)
         batch_dict['terminated_flags'] = terminated_flags
         batch_dict['reward_raw'] =reward_raw / self.horizon_length
         batch_dict['played_frames'] = self.batch_size
@@ -479,6 +529,7 @@ class AMPAgent(common_agent.CommonAgent):
         for k, v in amp_rewards.items():
             batch_dict[k] = a2c_common.swap_and_flatten01(v)
         batch_dict['mb_rewards'] = a2c_common.swap_and_flatten01(mb_rewards)
+        batch_dict['style_rewards'] = a2c_common.swap_and_flatten01(mb_style_rewards)
         
         return batch_dict
 
@@ -493,6 +544,12 @@ class AMPAgent(common_agent.CommonAgent):
         dataset_dict['slider'] = batch_dict['slider']                      # agent 分支
         dataset_dict['demo_slider'] = batch_dict['demo_slider']            # demo 分支
         dataset_dict['amp_replay_slider'] = batch_dict['amp_replay_slider']  # replay 分支
+        # === AAA W5: style-specific PPO 字段进 dataset ===
+        # 为什么：super().prepare_dataset 不保证透传自定义字段；calc_gradients 需要按同一 sample_idx
+        #   切出 style_advantages，才能和 action_log_probs 对齐。
+        dataset_dict['style_advantages'] = batch_dict['style_advantages']
+        dataset_dict['style_rewards'] = batch_dict['style_rewards']
+        # === AAA end ===
         # === AAA end ===
 
             
@@ -596,6 +653,7 @@ class AMPAgent(common_agent.CommonAgent):
         train_info['terminated_flags'] = batch_dict['terminated_flags']
         train_info['reward_raw'] = batch_dict['reward_raw']
         train_info['mb_rewards'] = batch_dict['mb_rewards']
+        train_info['style_rewards'] = batch_dict['style_rewards']
         train_info['returns'] = batch_dict['returns']
         self._record_train_batch_info(batch_dict, train_info)
         self.post_epoch(self.epoch_num)
@@ -606,10 +664,14 @@ class AMPAgent(common_agent.CommonAgent):
             _sa = self.model.a2c_network.style_alpha
             _g = _sa.grad
             _gv = float(_g.item()) if (_g is not None) else float('nan')
+            _style_r = float(batch_dict['style_rewards'].mean()) if 'style_rewards' in batch_dict else float('nan')
+            _style_loss = torch_ext.mean_list(train_info.get('aaa_style_actor_loss', [torch.tensor(float('nan'))])).item()
+            _contrast_loss = torch_ext.mean_list(train_info.get('aaa_contrast_loss', [torch.tensor(float('nan'))])).item()
             print(f'[AAA probe] Ep{self.epoch_num} alpha={_sa.item():+.5f} grad={_gv:+.3e} '
                   f'r_content={getattr(self,"_probe_r_content",float("nan")):.4f} '
                   f'r_disc={getattr(self,"_probe_r_disc",float("nan")):.4f} '
-                  f'r_respen={getattr(self,"_probe_r_respen",float("nan")):.4f}', flush=True)
+                  f'r_style={_style_r:.4f} r_respen={getattr(self,"_probe_r_respen",float("nan")):.4f} '
+                  f'style_loss={_style_loss:+.4f} contrast={_contrast_loss:+.4f}', flush=True)
         # === AAA end ===
         
         return train_info
@@ -622,20 +684,21 @@ class AMPAgent(common_agent.CommonAgent):
         #   直接大 α = 大随机扰动 → destabilize，故先 ramp 0→target 让 residual 学映射再放大；
         #   ramp 结束后 clamp 下界锁 |α|≥clamp，防被 content 拉回 0.02（探针观测到的失败模式）。
         # 做什么：每 epoch 开头按 mode 调 style_alpha.data。
-        #   none（默认）=不干预，smoke/w3 零回归；schedule=ramp+clamp（方案A 重训用）。
+        #   none（默认）=不干预，smoke/w3 零回归；schedule=ramp+clamp（方案A 重训用）；
+        #   warmup=只 ramp 到 target，不 clamp（W5 step_width canary 用，避免大 α 放大 slider-independent residual）。
         #   ramp 期覆盖 α.data 会抹掉 PPO 上一 epoch 的 α 更新——这是 schedule 本意（强制轨迹）；
         #   PPO 的 Adam m/v 不受影响，grad 继续反传，ramp 结束后 PPO 自由推（仅受 clamp 下界约束）。
         _alpha_mode = os.environ.get('AAA_ALPHA_MODE', 'none')
-        if _alpha_mode == 'schedule' and hasattr(self.model, 'a2c_network') \
+        if _alpha_mode in ['schedule', 'warmup'] and hasattr(self.model, 'a2c_network') \
                 and hasattr(self.model.a2c_network, 'style_alpha'):
             _sa = self.model.a2c_network.style_alpha
-            _target = float(os.environ.get('AAA_ALPHA_TARGET', '-0.3'))
+            _target = float(os.environ.get('AAA_ALPHA_TARGET', '-0.1' if _alpha_mode == 'warmup' else '-0.3'))
             _ramp_ep = int(os.environ.get('AAA_ALPHA_RAMP_EP', '50'))
             _clamp = float(os.environ.get('AAA_ALPHA_CLAMP', '0.2'))
             if _ramp_ep > 0 and epoch_num <= _ramp_ep:
                 # 线性 ramp 0 → target（epoch 0 → 0，epoch ramp_ep → target）
                 _sa.data.fill_(_target * (epoch_num / _ramp_ep))
-            else:
+            elif _alpha_mode == 'schedule':
                 # ramp 结束后只锁下界 |α|≥clamp（符号跟随 target），PPO 自由推
                 if _target < 0:
                     _sa.data.clamp_(max=-_clamp)   # α ≤ -clamp（负方向 |α|≥clamp）
@@ -698,6 +761,7 @@ class AMPAgent(common_agent.CommonAgent):
         value_preds_batch = input_dict['old_values']
         old_action_log_probs_batch = input_dict['old_logp_actions']
         advantage = input_dict['advantages']
+        style_advantage = input_dict.get('style_advantages', None)
         old_mu_batch = input_dict['mu']
         old_sigma_batch = input_dict['sigma']
         return_batch = input_dict['returns']
@@ -764,12 +828,27 @@ class AMPAgent(common_agent.CommonAgent):
                 old_action_log_probs_batch, action_log_probs, advantage, values, entropy, mu, sigma, return_batch, old_mu_batch, old_sigma_batch = \
                     old_action_log_probs_batch[rnn_mask_bool], action_log_probs[rnn_mask_bool], advantage[rnn_mask_bool], values[rnn_mask_bool], \
                         entropy[rnn_mask_bool], mu[rnn_mask_bool], sigma[rnn_mask_bool], return_batch[rnn_mask_bool], old_mu_batch[rnn_mask_bool], old_sigma_batch[rnn_mask_bool]
+                if style_advantage is not None:
+                    style_advantage = style_advantage[rnn_mask_bool]
                 
                 # flatten values for computing loss
                 
                 
             a_info = self._actor_loss(old_action_log_probs_batch, action_log_probs, advantage, curr_e_clip)
             a_loss = a_info['actor_loss']
+            # === AAA W5: style-specific PPO actor loss（默认 coef=0 零回归）===
+            # 为什么：C+ reward-shaping-only 失败说明 style reward 混进总 reward 后被 content/disc 稀释；
+            #   这里用单独 GAE 得到的 style_advantage 再加一条 PPO actor loss，让 step_width metric
+            #   有独立策略梯度通道。
+            if self._aaa_style_adv_coef > 0.0 and style_advantage is not None:
+                _style_adv = style_advantage
+                if self.normalize_advantage:
+                    _style_adv = (_style_adv - _style_adv.mean()) / (_style_adv.std() + 1e-8)
+                style_a_info = self._actor_loss(old_action_log_probs_batch, action_log_probs, _style_adv, curr_e_clip)
+                style_a_loss = torch.mean(style_a_info['actor_loss'])
+            else:
+                style_a_loss = torch.zeros((), device=self.ppo_device)
+            # === AAA end ===
 
             c_info = self._critic_loss(value_preds_batch, values, curr_e_clip, return_batch, self.clip_value)
             c_loss = c_info['critic_loss']
@@ -786,14 +865,49 @@ class AMPAgent(common_agent.CommonAgent):
             disc_info = self._disc_loss(disc_agent_cat_logit, disc_demo_logit, amp_obs_demo)
             disc_loss = disc_info['disc_loss']
 
+            # === AAA W5: residual contrast loss（默认 coef=0 零回归）===
+            # 为什么：当前最硬失败点是同 obs 切 slider 时 Δa 只有 1.10% 变化；物理 reward 链路太长，
+            #   需要一条直接作用到 slider_encoder + style_residual 的可微信号，强制 adapter 读 slider。
+            # 做什么：同一 obs 构造 step_width low/high 两个 slider，最大化 Δa 差异；同时用 delta/kl
+            #   约束防止无意义大动作。alpha_floor 在 α 过小时给 residual 有效梯度，不改变真实 eval_actor。
+            if self._aaa_contrast_coef > 0.0 and getattr(self.model.a2c_network, 'style_enabled', False):
+                _slider_mid = input_dict['slider'].clone()
+                _slider_low = _slider_mid.clone()
+                _slider_high = _slider_mid.clone()
+                _slider_low[:, self._aaa_contrast_dim] = 0.0
+                _slider_high[:, self._aaa_contrast_dim] = 1.0
+                _sa = self.model.a2c_network.style_alpha
+                _sign = torch.sign(_sa.detach())
+                if torch.abs(_sign).item() < 0.5:
+                    _sign = torch.tensor(-1.0, device=self.ppo_device)
+                _alpha_eff = _sign * torch.clamp(torch.abs(_sa.detach()), min=self._aaa_contrast_alpha_floor)
+                _delta_low = self.model.a2c_network.eval_style_delta(obs_batch_processed, _slider_low, alpha_override=_alpha_eff)
+                _delta_high = self.model.a2c_network.eval_style_delta(obs_batch_processed, _slider_high, alpha_override=_alpha_eff)
+                contrast_loss = -torch.norm(_delta_high - _delta_low, dim=-1).mean()
+                contrast_delta_loss = ((_delta_low ** 2).sum(dim=-1) + (_delta_high ** 2).sum(dim=-1)).mean()
+                contrast_kl_loss = ((mu - old_mu_batch) ** 2).sum(dim=-1).mean()
+            else:
+                contrast_loss = torch.zeros((), device=self.ppo_device)
+                contrast_delta_loss = torch.zeros((), device=self.ppo_device)
+                contrast_kl_loss = torch.zeros((), device=self.ppo_device)
+            # === AAA end ===
+
             loss = a_loss + self.critic_coef * c_loss - self.entropy_coef * entropy + self.bounds_loss_coef * b_loss \
-                + self._disc_coef * disc_loss
+                + self._disc_coef * disc_loss \
+                + self._aaa_style_adv_coef * style_a_loss \
+                + self._aaa_contrast_coef * contrast_loss \
+                + self._aaa_contrast_delta_coef * contrast_delta_loss \
+                + self._aaa_contrast_kl_coef * contrast_kl_loss
             
             
             a_clip_frac = torch.mean(a_info['actor_clipped'].float())
 
             a_info['actor_loss'] = a_loss
             a_info['actor_clip_frac'] = a_clip_frac
+            a_info['aaa_style_actor_loss'] = style_a_loss.detach()
+            a_info['aaa_contrast_loss'] = contrast_loss.detach()
+            a_info['aaa_contrast_delta_loss'] = contrast_delta_loss.detach()
+            a_info['aaa_contrast_kl_loss'] = contrast_kl_loss.detach()
             c_info['critic_loss'] = c_loss
 
             if self.multi_gpu:
@@ -968,6 +1082,11 @@ class AMPAgent(common_agent.CommonAgent):
         #   训练时取 mb_slider 喂 conditional disc（reward 路径）+ minibatch 喂 disc（训练路径）。
         #   加进 tensor_list 使 play_steps 的 get_transformed_list 把 slider 塞进 batch_dict（供 replay 存盘）。
         self.experience_buffer.tensor_dict['slider'] = torch.zeros(batch_shape + (6,), device=self.ppo_device)
+        # === AAA W5: C+ metric style reward buffer ===
+        # 为什么：style-specific PPO advantage 需要保留 env 侧独立 r_style，不能只依赖已混合的 rewards。
+        #   默认 loss coef=0 时只记录不参与优化。
+        self.experience_buffer.tensor_dict['style_reward'] = torch.zeros(batch_shape + (1,), device=self.ppo_device)
+        # === AAA end ===
         # === AAA W4: res_penalty buffer（‖Δa‖²，w4 patch §8.3）===
         # 为什么：存每步 ‖Δa‖² 供 reward 合并时减 λ_res·‖Δa‖²（tanh 硬界双保险的 norm 惩罚，抉择2）。
         #   Δa 由 eval_actor 缓存（network 侧 _last_delta_a），play_steps 取算。shape (num_envs, horizon, 1) 对齐 rewards。
@@ -983,6 +1102,7 @@ class AMPAgent(common_agent.CommonAgent):
 
         self.tensor_list += ['amp_obs']
         self.tensor_list += ['slider']  # AAA W4: slider 随 amp_obs 进 batch_dict
+        self.tensor_list += ['style_reward']  # AAA W5: r_style 随 rollout 进 batch_dict
         return
 
     def _init_amp_demo_buf(self):
