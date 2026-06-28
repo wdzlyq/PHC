@@ -31,6 +31,8 @@ aaa_cplus_dim: "step_width"
 aaa_cplus_target_range: 0.2
 aaa_cplus_style_reward_w: 0.0
 aaa_cplus_step_beta: 10.0
+aaa_cplus_signed_style_scale: 10.0
+aaa_cplus_signed_style_clip: 1.0
 aaa_cplus_step_p10: 0.15
 aaa_cplus_step_p90: 0.45
 aaa_cplus_step_axis: 0

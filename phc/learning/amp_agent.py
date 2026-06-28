@@ -843,7 +843,12 @@ class AMPAgent(common_agent.CommonAgent):
             if self._aaa_style_adv_coef > 0.0 and style_advantage is not None:
                 _style_adv = style_advantage
                 if self.normalize_advantage:
-                    _style_adv = (_style_adv - _style_adv.mean()) / (_style_adv.std() + 1e-8)
+                    # === AAA W5: keep signed style direction during advantage scaling ===
+                    # 为什么：step_width contrast canary 中 r_style 近似常数，mean-zero normalize 把 style actor
+                    #   loss 压成 0；signed improvement reward 已经提供正/负方向，不能再减 batch mean。
+                    # 做什么：只按 std 缩放以控制量级，保留 advantage 的符号和均值方向。
+                    _style_adv = _style_adv / (_style_adv.std() + 1e-8)
+                    # === AAA end ===
                 style_a_info = self._actor_loss(old_action_log_probs_batch, action_log_probs, _style_adv, curr_e_clip)
                 style_a_loss = torch.mean(style_a_info['actor_loss'])
             else:

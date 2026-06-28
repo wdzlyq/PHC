@@ -124,6 +124,8 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
         self._aaa_cplus_target_range = float(cfg["env"].get("aaa_cplus_target_range", 0.2))
         self._aaa_cplus_style_reward_w = float(cfg["env"].get("aaa_cplus_style_reward_w", 0.0))
         self._aaa_cplus_step_beta = float(cfg["env"].get("aaa_cplus_step_beta", 10.0))
+        self._aaa_cplus_signed_style_scale = float(cfg["env"].get("aaa_cplus_signed_style_scale", 10.0))
+        self._aaa_cplus_signed_style_clip = float(cfg["env"].get("aaa_cplus_signed_style_clip", 1.0))
         self._aaa_cplus_step_p10 = float(cfg["env"].get("aaa_cplus_step_p10", 0.15))
         self._aaa_cplus_step_p90 = float(cfg["env"].get("aaa_cplus_step_p90", 0.45))
         self._aaa_cplus_step_axis = int(cfg["env"].get("aaa_cplus_step_axis", 0))
@@ -280,7 +282,18 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
         denom = max(self._aaa_cplus_step_p90 - self._aaa_cplus_step_p10, 1e-6)
         step_norm = torch.clamp((step_raw - self._aaa_cplus_step_p10) / denom, 0.0, 1.0)
         target = self.style_labels[:, 1]
-        r_style = torch.exp(-self._aaa_cplus_step_beta * torch.square(step_norm - target))
+        # === AAA W5: signed metric-aligned style reward ===
+        # 为什么：exp(-β gap²) 在 contrast canary 中近似常数，style advantage 归一化后方向信号归零；
+        #   contrast 已证明能让 adapter 读 slider，但不规定语义方向，必须用 metric improvement 校正方向。
+        # 做什么：用原 motion 的归一化 step_width 作为 do-nothing baseline；当前 rollout 比 origin 更接近
+        #   target 则给正奖励，朝反方向走给负奖励。这样 style_adv 有明确正负方向。
+        origin = self.origin_style_labels[:, 1]
+        err_origin = torch.square(origin - target)
+        err_current = torch.square(step_norm - target)
+        r_style = self._aaa_cplus_signed_style_scale * (err_origin - err_current)
+        if self._aaa_cplus_signed_style_clip > 0.0:
+            r_style = torch.clamp(r_style, -self._aaa_cplus_signed_style_clip, self._aaa_cplus_signed_style_clip)
+        # === AAA end ===
         self.rew_buf[:] += self._aaa_cplus_style_reward_w * r_style
         self._aaa_cplus_last_step_width_norm[:] = step_norm.detach()
         self._aaa_cplus_last_style_reward[:] = r_style.detach()
