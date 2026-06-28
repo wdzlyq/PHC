@@ -31,15 +31,14 @@ def _pick_motion(env_task, motion_key=None, motion_id=None):
 
 
 def _build_slider_ladder(slider_dim, device):
-    # === AAA W4: slider ladder（每个 env 一种配置）===
-    # env0=style0(zeros), env1=energy=1, env2=step_width=1, env3=elbow_bend=1, env4=全1
-    # 其余槽位（vert_bob/cadence/trunk_sway）置 0（W4 起步 3 维，抉择7）
-    ladder = torch.zeros(5, slider_dim, device=device)
-    ladder[1, 0] = 1.0  # energy=1
-    ladder[2, 1] = 1.0  # step_width=1
-    ladder[3, 2] = 1.0  # elbow_bend=1
-    ladder[4, :3] = 1.0  # 全 1
-    labels = ['style0', 'energy=1', 'step_width=1', 'elbow_bend=1', 'all=1']
+    # === AAA W5: C+ step_width-only canary ladder ===
+    # 为什么：W4 多维 ladder 在 slider↔motion 混淆下不可诊断；C+ 第一刀只验 step_width 单维，
+    #   固定内容 motion 后切 target step_width=0/0.25/0.5/0.75/1，看 actual step_width 是否单调。
+    # 做什么：仅设置 slider 第1维（step_width），其余维度为 0，占位但不作为 C+ reward 目标。
+    vals = torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0], device=device)
+    ladder = torch.zeros(vals.shape[0], slider_dim, device=device)
+    ladder[:, 1] = vals
+    labels = [f'step_width={float(v):.2f}' for v in vals]
     return ladder, labels
 
 

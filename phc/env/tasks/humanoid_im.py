@@ -112,7 +112,25 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
         _name2style = {row["clip"]: torch.tensor([row[c] for c in _style_cols], dtype=torch.float, device=self.device) for _, row in _sl_df.iterrows()}
         _motion_keys = self._motion_lib._motion_data_keys  # np.array[str], 顺序 = motion_id 下标
         self._style_table = torch.stack([_name2style[k] for k in _motion_keys], dim=0)  # (num_motions, 6)
-        self.style_labels = torch.zeros((self.num_envs, 6), device=self.device)  # 每 env 当前 slider，随 reset 更新
+        self.origin_style_labels = torch.zeros((self.num_envs, 6), device=self.device)  # AAA C+: 当前 motion 原生 slider
+        self.style_labels = torch.zeros((self.num_envs, 6), device=self.device)  # 每 env 当前 target slider，随 reset 更新
+
+        # === AAA W5: C+ step_width-only counterfactual target + metric reward 配置 ===
+        # 为什么：W4 方案A α=-0.3 后 sweep 仍 flat，根因是 one-label-per-motion 下 slider 与 motion 混淆；
+        #   C+ 需要训练时给同一 motion 采样反事实 target_slider，并用物理指标 reward 直接锚定。
+        # 做什么：默认关闭保持 W4 行为；打开后仅扰动 step_width 维，其他 slider 维保持 origin，降低分布冲击。
+        self._aaa_cplus_enable = bool(cfg["env"].get("aaa_cplus_enable", False))
+        self._aaa_cplus_dim = cfg["env"].get("aaa_cplus_dim", "step_width")
+        self._aaa_cplus_target_range = float(cfg["env"].get("aaa_cplus_target_range", 0.2))
+        self._aaa_cplus_style_reward_w = float(cfg["env"].get("aaa_cplus_style_reward_w", 0.0))
+        self._aaa_cplus_step_beta = float(cfg["env"].get("aaa_cplus_step_beta", 10.0))
+        self._aaa_cplus_step_p10 = float(cfg["env"].get("aaa_cplus_step_p10", 0.15))
+        self._aaa_cplus_step_p90 = float(cfg["env"].get("aaa_cplus_step_p90", 0.45))
+        self._aaa_cplus_step_axis = int(cfg["env"].get("aaa_cplus_step_axis", 0))
+        self._aaa_cplus_step_width_body_ids = self._build_aaa_cplus_step_width_body_ids(cfg)
+        self._aaa_cplus_last_step_width_norm = torch.zeros(self.num_envs, device=self.device)
+        self._aaa_cplus_last_style_reward = torch.zeros(self.num_envs, device=self.device)
+        # === AAA end ===
         # === AAA end ===
 
         if self.humanoid_type in ['h1', 'g1', ]:
@@ -225,6 +243,48 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
             #     control.set_front(np.array([1, 0, 0]))
             #     control.set_zoom(0.001)
 
+
+    # === AAA W5: C+ step_width-only helpers ===
+    # 为什么：C+ 把 style_labels 从“motion 原生标签”升级为“训练目标 slider”，同时保留 origin_style_labels
+    #   供诊断/relative control；step_width reward 需要稳定复用同一组脚踝 body id。
+    # 做什么：用 env config/body_names 建脚踝索引，并在 reset 时生成 local counterfactual target。
+    def _build_aaa_cplus_step_width_body_ids(self, cfg):
+        body_names = cfg["env"].get("aaa_cplus_step_width_bodies", None)
+        if body_names is None:
+            if "L_Ankle" in self._body_names and "R_Ankle" in self._body_names:
+                body_names = ["L_Ankle", "R_Ankle"]
+            elif "left_ankle_roll_link" in self._body_names and "right_ankle_roll_link" in self._body_names:
+                body_names = ["left_ankle_roll_link", "right_ankle_roll_link"]
+            else:
+                body_names = [self._body_names[3], self._body_names[7]]  # SMPL_MUJOCO fallback，保持 W4 sweep 约定
+        return self._build_key_body_ids_tensor(body_names)
+
+    def _aaa_cplus_sample_target_slider(self, origin_slider):
+        # 为什么：C+ 破 slider↔motion 混淆的必要条件——训练时给同一 motion 采样与原标签解耦的 target。
+        # 做什么：默认关闭/test 时直接返回 origin（W4 零回归）；开启时只扰动 step_width 维，其余维保持 origin。
+        target_slider = origin_slider.clone()
+        if self._aaa_cplus_enable and self._aaa_cplus_dim == "step_width" and not flags.test:
+            delta = (torch.rand(origin_slider.shape[0], device=self.device) * 2.0 - 1.0) * self._aaa_cplus_target_range
+            target_slider[:, 1] = torch.clamp(origin_slider[:, 1] + delta, 0.0, 1.0)
+        return target_slider
+
+    def _aaa_cplus_apply_step_width_reward(self, body_pos):
+        if (not self._aaa_cplus_enable) or self._aaa_cplus_style_reward_w <= 0.0 or self._aaa_cplus_dim != "step_width":
+            self._aaa_cplus_last_step_width_norm.zero_()
+            self._aaa_cplus_last_style_reward.zero_()
+            return
+
+        ankle_pos = body_pos[:, self._aaa_cplus_step_width_body_ids, :]  # (num_envs, 2, 3)
+        step_raw = torch.abs(ankle_pos[:, 0, self._aaa_cplus_step_axis] - ankle_pos[:, 1, self._aaa_cplus_step_axis])
+        denom = max(self._aaa_cplus_step_p90 - self._aaa_cplus_step_p10, 1e-6)
+        step_norm = torch.clamp((step_raw - self._aaa_cplus_step_p10) / denom, 0.0, 1.0)
+        target = self.style_labels[:, 1]
+        r_style = torch.exp(-self._aaa_cplus_step_beta * torch.square(step_norm - target))
+        self.rew_buf[:] += self._aaa_cplus_style_reward_w * r_style
+        self._aaa_cplus_last_step_width_norm[:] = step_norm.detach()
+        self._aaa_cplus_last_style_reward[:] = r_style.detach()
+
+    # === AAA end ===
 
     def render(self, sync_frame_time = False, i = 0):
         super().render(sync_frame_time=sync_frame_time)
@@ -690,7 +750,10 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
         # === AAA W4: slider 随 amp_obs 一起进 extras（复用 amp_obs buffer 路径，w4 patch §1.2）===
         # 为什么：agent 侧从 infos['slider'] 取进 experience_buffer（仿 infos['amp_obs']，amp_agent.py:355），
         #   不自造 threading。super().post_physics_step 已在此前设好 extras['amp_obs']，slider 同处塞入。
-        self.extras["slider"] = self.style_labels  # (num_envs, 6) raw slider
+        self.extras["slider"] = self.style_labels  # (num_envs, 6) target slider；C+ 关闭时等于 origin slider
+        self.extras["origin_slider"] = self.origin_style_labels  # (num_envs, 6) motion 原生 slider，诊断用
+        self.extras["aaa_cplus_step_width_norm"] = self._aaa_cplus_last_step_width_norm
+        self.extras["aaa_cplus_style_reward"] = self._aaa_cplus_last_style_reward
         # === AAA end ===
 
         if flags.im_eval:
@@ -966,7 +1029,14 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
 
             self.rew_buf[:] += power_reward
             self.reward_raw = torch.cat([self.reward_raw, power_reward[:, None]], dim=-1)
-        
+
+        # === AAA W5: C+ step_width-only metric-anchored reward ===
+        # 为什么：W4 conditional disc 在 one-label-per-motion 下会忽略 slider；C+ 用在线物理指标直接给
+        #   target step_width 监督，第一版只做 reward shaping，不改 PPO loss / AMP buffer。
+        # 做什么：从当前 sim body_pos 算脚踝横向距离，robust normalize 后与 style_labels[:,1] 对齐。
+        self._aaa_cplus_apply_step_width_reward(self._rigid_body_pos)
+        # === AAA end ===
+
         return
     
     def _reset_envs(self, env_ids):
@@ -988,7 +1058,9 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
         #   motion_lib 内部用 remainder(motion_id, _num_unique_motions) 取模映射（motion_lib_base.py:210）。
         #   故 slider 索引必须同样 % num_unique_motions，否则 motion_id=1023 > 138 越界（W4 验收首跑崩点）。
         _mid = self._sampled_motion_ids[env_ids] % self._motion_lib._num_unique_motions
-        self.style_labels[env_ids] = self._style_table[_mid]
+        _origin_slider = self._style_table[_mid]
+        self.origin_style_labels[env_ids] = _origin_slider
+        self.style_labels[env_ids] = self._aaa_cplus_sample_target_slider(_origin_slider)
         # === AAA end ===
         # self._motion_lib.update_sampling_history(env_ids)
 

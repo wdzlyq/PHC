@@ -94,5 +94,13 @@ params:
     disc_reward_w: 0.5  # AAA 方案A v2: 风格 reward 权重 0.3→0.5（增强 disc 杠杆力③，探针定因后）
     res_lambda: 0.0     # AAA 方案A v2: 去掉 residual norm 惩罚力①（探针证它本就 tiny 且压制 α；tanh 硬界已足够 bounded）
 
-    player: 
+    # === AAA W5: C+ canary 学习侧记录项（env 侧同名配置才实际驱动 reward）===
+    # 为什么：C+ 主监督是 env._compute_reward 的 step_width metric reward；这里保留默认关闭/0权重，
+    #   方便训练命令统一 override 与实验记录，避免误以为 conditional disc 仍是主风格项。
+    aaa_cplus_enable: False
+    aaa_cplus_style_reward_w: 0.0
+    aaa_cplus_target_range: 0.2
+    # === AAA end ===
+
+    player:
         games_num: 50000000

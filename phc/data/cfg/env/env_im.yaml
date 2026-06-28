@@ -22,6 +22,21 @@ min_length: 5
 kp_scale: 1
 power_reward: True
 
+# === AAA W5: C+ step_width-only canary（默认关闭，保持 W4 零回归）===
+# 为什么：W4 α=-0.3 后 sweep 仍 flat，根因是 slider↔motion 混淆；C+ 训练时采样反事实 target slider，
+#   并用在线 step_width 物理指标 reward 直接锚定 target。
+# 做什么：第一版只开 step_width 维；其他维度保持 origin slider。云端 canary 用 env.aaa_cplus_enable=True 开启。
+aaa_cplus_enable: False
+aaa_cplus_dim: "step_width"
+aaa_cplus_target_range: 0.2
+aaa_cplus_style_reward_w: 0.0
+aaa_cplus_step_beta: 10.0
+aaa_cplus_step_p10: 0.15
+aaa_cplus_step_p90: 0.45
+aaa_cplus_step_axis: 0
+aaa_cplus_step_width_bodies: ["L_Ankle", "R_Ankle"]
+# === AAA end ===
+
 shape_resampling_interval: 500
 
 control_mode: "isaac_pd"
