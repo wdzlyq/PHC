@@ -130,6 +130,7 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
         self._aaa_cplus_step_width_body_ids = self._build_aaa_cplus_step_width_body_ids(cfg)
         self._aaa_cplus_last_step_width_norm = torch.zeros(self.num_envs, device=self.device)
         self._aaa_cplus_last_style_reward = torch.zeros(self.num_envs, device=self.device)
+        self._aaa_cplus_probe_step = 0  # AAA W5: C+ reward probe step counter
         # === AAA end ===
         # === AAA end ===
 
@@ -283,6 +284,18 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
         self.rew_buf[:] += self._aaa_cplus_style_reward_w * r_style
         self._aaa_cplus_last_step_width_norm[:] = step_norm.detach()
         self._aaa_cplus_last_style_reward[:] = r_style.detach()
+        # === AAA W5: C+ reward probe (gated by AAA_PROBE, print every 512 steps) ===
+        # Why: W4 repeatedly found slider ignored only after full runs; C+ must show
+        #   step_norm/target/r_style within first 5 epochs, else a flat 300ep sweep
+        #   cannot distinguish "C+ ineffective" from "reward-path bug". Zero-regression: prints only when AAA_PROBE set.
+        if __import__("os").environ.get("AAA_PROBE"):
+            self._aaa_cplus_probe_step += 1
+            if self._aaa_cplus_probe_step % 512 == 0:
+                _sn = float(step_norm.mean()); _tg = float(target.mean()); _rs = float(r_style.mean())
+                print(f"[AAA cplus] step={self._aaa_cplus_probe_step} step_norm_mean={_sn:.4f} "
+                      f"target_mean={_tg:.4f} gap={_sn-_tg:+.4f} r_style_mean={_rs:.4f} "
+                      f"w={self._aaa_cplus_style_reward_w}", flush=True)
+        # === AAA end ===
 
     # === AAA end ===
 
