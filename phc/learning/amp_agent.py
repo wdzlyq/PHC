@@ -1104,7 +1104,6 @@ class AMPAgent(common_agent.CommonAgent):
                 # 注：retain_graph=True 的多次 autograd.grad 会累积显存（8 loss × 3 group = 24 次），
                 # 1024 env 下会 OOM。用 AAA_GRAD_AUDIT_ENVS 降 num_envs 或减少 group 数规避。
                 self._aaa_grad_audit_count += 1
-                self._aaa_grad_audit_count += 1
                 _net = self.model.a2c_network
                 if getattr(_net, 'style_enabled', False):
                     _audit_param_groups = {
