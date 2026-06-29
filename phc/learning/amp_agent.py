@@ -89,6 +89,8 @@ class AMPAgent(common_agent.CommonAgent):
         self._aaa_joint_step_right_idx = int(config.get('aaa_joint_step_right_idx', 12))
         self._aaa_joint_step_left_sign = float(config.get('aaa_joint_step_left_sign', 1.0))
         self._aaa_joint_step_right_sign = float(config.get('aaa_joint_step_right_sign', -1.0))
+        # === AAA 诊断C: 梯度审计计数器（gated by AAA_GRAD_AUDIT env var，默认关零回归）===
+        self._aaa_grad_audit_count = 0
         # === AAA end ===
 
         kin_lr = float(self.vec_env.env.task.kin_lr)
@@ -1088,6 +1090,52 @@ class AMPAgent(common_agent.CommonAgent):
             else:
                 joint_step_loss = torch.zeros((), device=self.ppo_device)
                 joint_step_gap = torch.zeros((), device=self.ppo_device)
+            # === AAA end ===
+
+            # === AAA 诊断C: 梯度审计（gated by AAA_GRAD_AUDIT，默认关零回归）===
+            # 为什么：codex 4 轮 proxy/reward 改动 + Claude expC 大α长训后 sweep 仍 flat/失稳，
+            #   需确认各 style loss 分量是否真进 style_residual/slider_encoder/style_alpha，
+            #   以及谁的梯度量级主导（reward 路径是否被 contrast/PPO 覆盖？）。
+            # 做什么：用 torch.autograd.grad（retain_graph）分别算每个 loss 分量对三组参数的
+            #   grad norm，不动 param.grad、不干扰主 backward。只打印前 N 个 minibatch。
+            if os.environ.get('AAA_GRAD_AUDIT', '0') == '1' and \
+               self._aaa_grad_audit_count < int(os.environ.get('AAA_GRAD_AUDIT_N', '3')) and \
+               self.epoch_num >= int(os.environ.get('AAA_GRAD_AUDIT_START_EP', '60')):
+                # 注：retain_graph=True 的多次 autograd.grad 会累积显存（8 loss × 3 group = 24 次），
+                # 1024 env 下会 OOM。用 AAA_GRAD_AUDIT_ENVS 降 num_envs 或减少 group 数规避。
+                self._aaa_grad_audit_count += 1
+                self._aaa_grad_audit_count += 1
+                _net = self.model.a2c_network
+                if getattr(_net, 'style_enabled', False):
+                    _audit_param_groups = {
+                        'style_residual': list(_net.style_residual.parameters()),
+                    }
+                    _audit_losses = {
+                        'a_loss(PPO)': a_loss,
+                        'disc_loss': disc_loss,
+                        'style_a_loss': style_a_loss,
+                        'contrast_loss': contrast_loss,
+                        'contrast_delta_loss': contrast_delta_loss,
+                        'contrast_kl_loss': contrast_kl_loss,
+                        'joint_step_loss': joint_step_loss,
+                        'proxy_dir_loss': proxy_dir_loss,
+                    }
+                    print(f"[AAA grad_audit] === minibatch #{self._aaa_grad_audit_count} ===", flush=True)
+                    _n_losses = len(_audit_losses)
+                    _i_loss = 0
+                    for _lname, _lobj in _audit_losses.items():
+                        _i_loss += 1
+                        for _gname, _gparams in _audit_param_groups.items():
+                            try:
+                                _grads = torch.autograd.grad(_lobj, _gparams,
+                                                             retain_graph=True, allow_unused=True)
+                                _gn_sq = 0.0
+                                for _g in _grads:
+                                    if _g is not None:
+                                        _gn_sq += float((_g.detach() ** 2).sum().item())
+                                print(f"[AAA grad_audit] {_lname:>22} -> {_gname:<16} grad_norm={_gn_sq ** 0.5:.6e}", flush=True)
+                            except RuntimeError as _e:
+                                print(f"[AAA grad_audit] {_lname:>22} -> {_gname:<16} ERR={_e}", flush=True)
             # === AAA end ===
 
             loss = a_loss + self.critic_coef * c_loss - self.entropy_coef * entropy + self.bounds_loss_coef * b_loss \
