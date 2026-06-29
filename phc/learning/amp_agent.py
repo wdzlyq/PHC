@@ -686,24 +686,38 @@ class AMPAgent(common_agent.CommonAgent):
         # 做什么：每 epoch 开头按 mode 调 style_alpha.data。
         #   none（默认）=不干预，smoke/w3 零回归；schedule=ramp+clamp（方案A 重训用）；
         #   warmup=只 ramp 到 target，不 clamp（W5 step_width canary 用，避免大 α 放大 slider-independent residual）。
+        #   fixed_positive=固定正 α 做 Step 6 方向诊断，验证反向 sweep 是否来自 α/residual 符号闭环。
         #   ramp 期覆盖 α.data 会抹掉 PPO 上一 epoch 的 α 更新——这是 schedule 本意（强制轨迹）；
         #   PPO 的 Adam m/v 不受影响，grad 继续反传，ramp 结束后 PPO 自由推（仅受 clamp 下界约束）。
         _alpha_mode = os.environ.get('AAA_ALPHA_MODE', 'none')
-        if _alpha_mode in ['schedule', 'warmup'] and hasattr(self.model, 'a2c_network') \
+        if _alpha_mode in ['schedule', 'warmup', 'fixed_positive'] and hasattr(self.model, 'a2c_network') \
                 and hasattr(self.model.a2c_network, 'style_alpha'):
             _sa = self.model.a2c_network.style_alpha
-            _target = float(os.environ.get('AAA_ALPHA_TARGET', '-0.1' if _alpha_mode == 'warmup' else '-0.3'))
-            _ramp_ep = int(os.environ.get('AAA_ALPHA_RAMP_EP', '50'))
-            _clamp = float(os.environ.get('AAA_ALPHA_CLAMP', '0.2'))
-            if _ramp_ep > 0 and epoch_num <= _ramp_ep:
-                # 线性 ramp 0 → target（epoch 0 → 0，epoch ramp_ep → target）
-                _sa.data.fill_(_target * (epoch_num / _ramp_ep))
-            elif _alpha_mode == 'schedule':
-                # ramp 结束后只锁下界 |α|≥clamp（符号跟随 target），PPO 自由推
-                if _target < 0:
-                    _sa.data.clamp_(max=-_clamp)   # α ≤ -clamp（负方向 |α|≥clamp）
-                else:
-                    _sa.data.clamp_(min=_clamp)
+            if _alpha_mode == 'fixed_positive':
+                # === AAA W5 Step 6: fixed positive alpha direction diagnosis ===
+                # 为什么：Ep150 真实 rollout 中 step_width 随 slider 稳定反向，而 adapter 已强读 slider；
+                #   需要隔离 α 符号，确认反向是否来自 α/residual 的符号组合，而不是继续加训或扩维。
+                # 做什么：用 AAA_ALPHA_VALUE（默认 +0.10）每 epoch 固定 α，并关闭该参数梯度，
+                #   让本次诊断只训练 residual/encoder，不让 optimizer 在 epoch 内把 α 推回负方向。
+                _value = abs(float(os.environ.get('AAA_ALPHA_VALUE', '0.10')))
+                _sa.requires_grad_(False)
+                _sa.data.fill_(_value)
+                # === AAA end ===
+            else:
+                if not _sa.requires_grad:
+                    _sa.requires_grad_(True)
+                _target = float(os.environ.get('AAA_ALPHA_TARGET', '-0.1' if _alpha_mode == 'warmup' else '-0.3'))
+                _ramp_ep = int(os.environ.get('AAA_ALPHA_RAMP_EP', '50'))
+                _clamp = float(os.environ.get('AAA_ALPHA_CLAMP', '0.2'))
+                if _ramp_ep > 0 and epoch_num <= _ramp_ep:
+                    # 线性 ramp 0 → target（epoch 0 → 0，epoch ramp_ep → target）
+                    _sa.data.fill_(_target * (epoch_num / _ramp_ep))
+                elif _alpha_mode == 'schedule':
+                    # ramp 结束后只锁下界 |α|≥clamp（符号跟随 target），PPO 自由推
+                    if _target < 0:
+                        _sa.data.clamp_(max=-_clamp)   # α ≤ -clamp（负方向 |α|≥clamp）
+                    else:
+                        _sa.data.clamp_(min=_clamp)
         # === AAA end ===
 
         # print("freeze running mean/std")
