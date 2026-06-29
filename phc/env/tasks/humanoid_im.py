@@ -123,6 +123,14 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
         self._aaa_cplus_dim = cfg["env"].get("aaa_cplus_dim", "step_width")
         self._aaa_cplus_target_range = float(cfg["env"].get("aaa_cplus_target_range", 0.2))
         self._aaa_cplus_style_reward_w = float(cfg["env"].get("aaa_cplus_style_reward_w", 0.0))
+        # === AAA 诊断D: style reward 是否进主 rew_buf（默认 1.0 零回归）===
+        # 为什么：codex canary 用 style_reward_w=1.0 让 direction reward 同时进主 rew_buf→主 GAE→主 a_loss
+        #   与 content advantage 混；诊断C 证 a_loss 对 style_residual 梯度(6.2e-1)远大于 style_a_loss(7.1e-3)，
+        #   主路径 diluted 方向主导 style_residual。设 in_main=0 让 r_style 仍写 _aaa_cplus_last_style_reward
+        #   （独立 style_advantage 通道活）但不加进 rew_buf，使独立 style_a_loss 成为 style_residual 唯一方向驱动。
+        # 做什么：in_main=1.0（默认，r_style 进主 rew_buf，旧行为零回归）；in_main=0.0（r_style 不进主 rew_buf，
+        #   仅走独立通道）。保留 style_reward_w 作为独立通道 reward 的 scale（仍需 >0 让函数不 early-return）。
+        self._aaa_cplus_style_reward_in_main = float(cfg["env"].get("aaa_cplus_style_reward_in_main", 1.0))
         self._aaa_cplus_step_beta = float(cfg["env"].get("aaa_cplus_step_beta", 10.0))
         self._aaa_cplus_signed_style_scale = float(cfg["env"].get("aaa_cplus_signed_style_scale", 10.0))
         self._aaa_cplus_signed_style_clip = float(cfg["env"].get("aaa_cplus_signed_style_clip", 1.0))
@@ -363,7 +371,8 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
             if self._aaa_cplus_direction_reward_w != 0.0:
                 r_style = r_style + self._aaa_cplus_direction_reward_w * r_direction
         # === AAA end ===
-        self.rew_buf[:] += self._aaa_cplus_style_reward_w * r_style
+        if self._aaa_cplus_style_reward_in_main > 0.0:
+            self.rew_buf[:] += self._aaa_cplus_style_reward_w * r_style
         self._aaa_cplus_last_step_width_norm[:] = step_norm.detach()
         self._aaa_cplus_last_style_reward[:] = r_style.detach()
         # === AAA W5: C+ reward probe (gated by AAA_PROBE, print every 512 steps) ===
