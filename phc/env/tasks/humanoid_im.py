@@ -128,6 +128,18 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
         self._aaa_cplus_signed_style_clip = float(cfg["env"].get("aaa_cplus_signed_style_clip", 1.0))
         self._aaa_cplus_direction_reward_w = float(cfg["env"].get("aaa_cplus_direction_reward_w", 0.0))
         self._aaa_cplus_direction_scale = float(cfg["env"].get("aaa_cplus_direction_scale", 0.2))
+        # === AAA W5 Step7-fix: origin metric 量纲重校 ===
+        # 为什么：Step6/7 canary sweep 全 flat，根因是 origin/target 用 style label 量纲(motion29 0.586)，
+        #   step_norm 用 online 量纲(motion29≈0.33)，两者系统性 offset 让 err_current 永远大、r_style 永远≈-0.5、
+        #   r_direction 永远饱和 -1，方向信号被淹没（与 target 方向无关）。重校=让 origin/target/step_norm
+        #   全部统一到 online step_norm 量纲。
+        # 做什么：origin_mode="label"(默认零回归，旧量纲错逻辑)；="ema" 时用 per-motion step_norm EMA 作
+        #   origin_online，target_online=origin_online+(target_slider-origin_slider)*amp，signed/direction 全 online 量纲。
+        #   EMA momentum 0.99 慢更新；lazy 建 buffer（reward 时 motion_lib 一定就绪）。
+        self._aaa_cplus_origin_mode = str(cfg["env"].get("aaa_cplus_origin_mode", "label"))
+        self._aaa_cplus_step_norm_ema_momentum = float(cfg["env"].get("aaa_cplus_step_norm_ema_momentum", 0.99))
+        self._aaa_cplus_step_target_amp = float(cfg["env"].get("aaa_cplus_step_target_amp", 0.15))
+        self._aaa_cplus_step_norm_ema = None  # lazy: (num_unique_motions,) per-motion online step_norm EMA
         self._aaa_cplus_step_p10 = float(cfg["env"].get("aaa_cplus_step_p10", 0.15))
         self._aaa_cplus_step_p90 = float(cfg["env"].get("aaa_cplus_step_p90", 0.45))
         self._aaa_cplus_step_axis = int(cfg["env"].get("aaa_cplus_step_axis", 0))
@@ -283,30 +295,73 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
         step_raw = torch.abs(ankle_pos[:, 0, self._aaa_cplus_step_axis] - ankle_pos[:, 1, self._aaa_cplus_step_axis])
         denom = max(self._aaa_cplus_step_p90 - self._aaa_cplus_step_p10, 1e-6)
         step_norm = torch.clamp((step_raw - self._aaa_cplus_step_p10) / denom, 0.0, 1.0)
-        target = self.style_labels[:, 1]
-        # === AAA W5: signed metric-aligned style reward ===
-        # 为什么：exp(-β gap²) 在 contrast canary 中近似常数，style advantage 归一化后方向信号归零；
-        #   contrast 已证明能让 adapter 读 slider，但不规定语义方向，必须用 metric improvement 校正方向。
-        # 做什么：用原 motion 的归一化 step_width 作为 do-nothing baseline；当前 rollout 比 origin 更接近
-        #   target 则给正奖励，朝反方向走给负奖励。这样 style_adv 有明确正负方向。
-        origin = self.origin_style_labels[:, 1]
-        err_origin = torch.square(origin - target)
-        err_current = torch.square(step_norm - target)
-        r_style = self._aaa_cplus_signed_style_scale * (err_origin - err_current)
-        if self._aaa_cplus_signed_style_clip > 0.0:
-            r_style = torch.clamp(r_style, -self._aaa_cplus_signed_style_clip, self._aaa_cplus_signed_style_clip)
+        target_slider = self.style_labels[:, 1]
+        origin_slider = self.origin_style_labels[:, 1]
 
-        # === AAA W5 Step 7: physical direction consistency reward ===
-        # 为什么：fixed-positive alpha 诊断把强反向 sweep 压成 flat，说明问题不是单纯 alpha 符号；
-        #   contrast 只让 action 随 slider 变，signed improvement 仍可能被绝对标定误差削弱。
-        # 做什么：按 target-origin 的符号直接奖励真实 step_width_norm 朝同方向移动，保证 slider 排序
-        #   对齐 physical metric 排序；默认权重 0，只有 Step7 canary 显式打开。
-        direction = torch.sign(target - origin)
-        progress = direction * (step_norm - origin)
-        scale = max(self._aaa_cplus_direction_scale, 1e-6)
-        r_direction = torch.clamp(progress / scale, -1.0, 1.0)
-        if self._aaa_cplus_direction_reward_w != 0.0:
-            r_style = r_style + self._aaa_cplus_direction_reward_w * r_direction
+        if self._aaa_cplus_origin_mode == "ema":
+            # === AAA W5 Step7-fix: online 量纲重校 ===
+            # 为什么：style label(motion29 0.586)与 online step_norm(0.33)不同量纲，旧逻辑 err_current 永远大、
+            #   r_style 永远负、r_direction 永远饱和，方向信号与 target 无关。改用 per-motion online EMA 作 origin。
+            # 做什么：origin_online=ema[mid]；target_online=origin_online+(target_slider-origin_slider)*amp；
+            #   signed/direction 全 online 量纲自洽。EMA 每步按 per-motion mean 更新。
+            mid = self._sampled_motion_ids % self._motion_lib._num_unique_motions
+            if self._aaa_cplus_step_norm_ema is None or self._aaa_cplus_step_norm_ema.shape[0] != int(self._motion_lib._num_unique_motions):
+                num_motions = int(self._motion_lib._num_unique_motions)
+                self._aaa_cplus_step_norm_ema = torch.full((num_motions,), float('nan'), device=self.device)
+            ema = self._aaa_cplus_step_norm_ema
+            origin_metric = ema[mid]
+            # 首次未初始化(NaN)回退 step_norm 本身：err_origin=err_current=0，r_style=0 不污染方向。
+            nan_mask = torch.isnan(origin_metric)
+            origin_metric = torch.where(nan_mask, step_norm, origin_metric)
+            target_metric = origin_metric + (target_slider - origin_slider) * self._aaa_cplus_step_target_amp
+
+            err_origin = torch.square(origin_metric - target_metric)
+            err_current = torch.square(step_norm - target_metric)
+            r_style = self._aaa_cplus_signed_style_scale * (err_origin - err_current)
+            if self._aaa_cplus_signed_style_clip > 0.0:
+                r_style = torch.clamp(r_style, -self._aaa_cplus_signed_style_clip, self._aaa_cplus_signed_style_clip)
+
+            direction = torch.sign(target_metric - origin_metric)
+            progress = direction * (step_norm - origin_metric)
+            scale = max(self._aaa_cplus_direction_scale, 1e-6)
+            r_direction = torch.clamp(progress / scale, -1.0, 1.0)
+            if self._aaa_cplus_direction_reward_w != 0.0:
+                r_style = r_style + self._aaa_cplus_direction_reward_w * r_direction
+
+            # EMA 更新：per-motion mean step_norm（同 motion 多 env 聚合后更新，避免顺序偏向）
+            with torch.no_grad():
+                sn = step_norm.detach()
+                sum_buf = torch.zeros_like(ema)
+                cnt_buf = torch.zeros_like(ema)
+                sum_buf.index_add_(0, mid, sn)
+                cnt_buf.index_add_(0, mid, torch.ones_like(sn))
+                valid = cnt_buf > 0
+                mean_per_motion = torch.where(valid, sum_buf / cnt_buf.clamp(min=1.0), ema)
+                uninitialized = torch.isnan(ema)
+                m = self._aaa_cplus_step_norm_ema_momentum
+                updated = torch.where(uninitialized, mean_per_motion, m * ema + (1.0 - m) * mean_per_motion)
+                self._aaa_cplus_step_norm_ema = torch.where(valid, updated, ema)
+        else:
+            # === AAA W5: signed metric-aligned style reward（旧 label 量纲逻辑，零回归）===
+            # 为什么：exp(-β gap²) 在 contrast canary 中近似常数，style advantage 归一化后方向信号归零；
+            #   contrast 已证明能让 adapter 读 slider，但不规定语义方向，必须用 metric improvement 校正方向。
+            # ⚠️ 已知 bug：origin/target 为 label 量纲，step_norm 为 online 量纲，系统性 offset 让 r_style
+            #    永远负、r_direction 永远饱和；保留仅为零回归复现，新实验应开 origin_mode=ema。
+            target = target_slider
+            origin = origin_slider
+            err_origin = torch.square(origin - target)
+            err_current = torch.square(step_norm - target)
+            r_style = self._aaa_cplus_signed_style_scale * (err_origin - err_current)
+            if self._aaa_cplus_signed_style_clip > 0.0:
+                r_style = torch.clamp(r_style, -self._aaa_cplus_signed_style_clip, self._aaa_cplus_signed_style_clip)
+
+            # === AAA W5 Step 7: physical direction consistency reward ===
+            direction = torch.sign(target - origin)
+            progress = direction * (step_norm - origin)
+            scale = max(self._aaa_cplus_direction_scale, 1e-6)
+            r_direction = torch.clamp(progress / scale, -1.0, 1.0)
+            if self._aaa_cplus_direction_reward_w != 0.0:
+                r_style = r_style + self._aaa_cplus_direction_reward_w * r_direction
         # === AAA end ===
         self.rew_buf[:] += self._aaa_cplus_style_reward_w * r_style
         self._aaa_cplus_last_step_width_norm[:] = step_norm.detach()
@@ -318,11 +373,15 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
         if __import__("os").environ.get("AAA_PROBE"):
             self._aaa_cplus_probe_step += 1
             if self._aaa_cplus_probe_step % 512 == 0:
-                _sn = float(step_norm.mean()); _tg = float(target.mean()); _rs = float(r_style.mean())
+                _sn = float(step_norm.mean()); _tg = float(target_slider.mean()); _rs = float(r_style.mean())
                 _rd = float(r_direction.mean())
                 print(f"[AAA cplus] step={self._aaa_cplus_probe_step} step_norm_mean={_sn:.4f} "
-                      f"target_mean={_tg:.4f} gap={_sn-_tg:+.4f} r_style_mean={_rs:.4f} "
+                      f"target_slider_mean={_tg:.4f} r_style_mean={_rs:.4f} "
                       f"r_direction_mean={_rd:.4f} w={self._aaa_cplus_style_reward_w}", flush=True)
+                if self._aaa_cplus_origin_mode == "ema":
+                    _om = float(origin_metric.mean()); _tm = float(target_metric.mean())
+                    print(f"[AAA cplus]   origin_metric_mean={_om:.4f} target_metric_mean={_tm:.4f} "
+                          f"online_gap={_sn-_om:+.4f}", flush=True)
         # === AAA end ===
 
     # === AAA end ===

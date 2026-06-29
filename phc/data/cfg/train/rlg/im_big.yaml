@@ -105,6 +105,9 @@ params:
     aaa_cplus_signed_style_clip: 1.0
     aaa_cplus_direction_reward_w: 0.0
     aaa_cplus_direction_scale: 0.2
+    aaa_cplus_origin_mode: label          # AAA Step7-fix: label(零回归旧逻辑)/ema(online 量纲重校)
+    aaa_cplus_step_norm_ema_momentum: 0.99
+    aaa_cplus_step_target_amp: 0.15       # online 量纲目标幅度: target_metric=origin+(target_slider-origin_slider)*amp
     # === AAA end ===
 
     # === AAA W5: step_width-only 修正计划 loss 开关（默认关闭，零回归）===
