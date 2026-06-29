@@ -65,6 +65,30 @@ class AMPAgent(common_agent.CommonAgent):
         self._aaa_contrast_kl_coef = float(config.get('aaa_contrast_kl_coef', 0.0))
         self._aaa_contrast_alpha_floor = float(config.get('aaa_contrast_alpha_floor', 0.1))
         self._aaa_contrast_dim = int(config.get('aaa_contrast_dim', 1))  # step_width dim
+        # === AAA W5 P2: learned differentiable step_width proxy (default off) ===
+        # 为什么：EMA canary 证明 reward 量纲已修，但真实 sweep 仍 flat；rollout reward→GAE→PPO
+        #   不能把 step_width 方向稳定写进 residual。P2 用 g(obs, action)->step_width_norm 监督拟合
+        #   在线物理指标，再用 g 的可微方向 loss 直通 style_residual。
+        # 做什么：proxy 自带 optimizer 仅训练 proxy；direction loss 冻结 proxy 权重，只让梯度流向
+        #   policy/action/residual。所有 coef 默认 0，零回归。
+        self._aaa_proxy_train_coef = float(config.get('aaa_proxy_train_coef', 0.0))
+        self._aaa_proxy_dir_coef = float(config.get('aaa_proxy_dir_coef', 0.0))
+        self._aaa_proxy_lr = float(config.get('aaa_proxy_lr', 1e-3))
+        self._aaa_proxy_hidden = int(config.get('aaa_proxy_hidden', 256))
+        self._aaa_proxy_margin = float(config.get('aaa_proxy_margin', 0.01))
+        self._aaa_proxy_grad_clip = float(config.get('aaa_proxy_grad_clip', 1.0))
+        self._aaa_proxy_dir_warmup_epochs = int(config.get('aaa_proxy_dir_warmup_epochs', 0))
+        self._aaa_step_proxy = None
+        self._aaa_step_proxy_opt = None
+        # === AAA W5 P2b: analytic/action-space step_width proxy (default off) ===
+        # 为什么：learned g(obs, action) 几乎不看 action；先用最小可控的髋部动作差异代理 step_width。
+        # SMPL actuator order: L_Hip_x/y/z=0/1/2, R_Hip_x/y/z=12/13/14。
+        self._aaa_joint_step_coef = float(config.get('aaa_joint_step_coef', 0.0))
+        self._aaa_joint_step_margin = float(config.get('aaa_joint_step_margin', 0.05))
+        self._aaa_joint_step_left_idx = int(config.get('aaa_joint_step_left_idx', 0))
+        self._aaa_joint_step_right_idx = int(config.get('aaa_joint_step_right_idx', 12))
+        self._aaa_joint_step_left_sign = float(config.get('aaa_joint_step_left_sign', 1.0))
+        self._aaa_joint_step_right_sign = float(config.get('aaa_joint_step_right_sign', -1.0))
         # === AAA end ===
 
         kin_lr = float(self.vec_env.env.task.kin_lr)
@@ -112,6 +136,9 @@ class AMPAgent(common_agent.CommonAgent):
         if "kin_optimizer" in self.__dict__:
             print("!!!saving kin_optimizer!!! Remove this message asa p!!")
             state['kin_optimizer'] = self.kin_optimizer.state_dict()
+        if self._aaa_step_proxy is not None:
+            state['aaa_step_proxy'] = self._aaa_step_proxy.state_dict()
+            state['aaa_step_proxy_opt'] = self._aaa_step_proxy_opt.state_dict()
 
         return state
 
@@ -226,6 +253,41 @@ class AMPAgent(common_agent.CommonAgent):
             res_dict['values'] = self.value_mean_std(res_dict['values'], True)
         return res_dict
 
+    # === AAA W5 P2: learned differentiable step_width proxy helpers ===
+    def _aaa_ensure_step_proxy(self, obs_dim, action_dim):
+        if self._aaa_step_proxy is not None:
+            return
+        self._aaa_step_proxy = nn.Sequential(
+            nn.Linear(obs_dim + action_dim, self._aaa_proxy_hidden),
+            nn.ELU(),
+            nn.Linear(self._aaa_proxy_hidden, self._aaa_proxy_hidden),
+            nn.ELU(),
+            nn.Linear(self._aaa_proxy_hidden, 1),
+        ).to(self.ppo_device)
+        self._aaa_step_proxy_opt = optim.Adam(self._aaa_step_proxy.parameters(), lr=self._aaa_proxy_lr)
+
+    def _aaa_step_proxy_forward(self, obs, action):
+        self._aaa_ensure_step_proxy(obs.shape[-1], action.shape[-1])
+        return self._aaa_step_proxy(torch.cat([obs, action], dim=-1))
+
+    def _aaa_train_step_proxy(self, obs, action, target):
+        if self._aaa_proxy_train_coef <= 0.0:
+            return torch.zeros((), device=self.ppo_device), torch.zeros((), device=self.ppo_device)
+        valid = torch.isfinite(target).squeeze(-1)
+        if valid.sum() == 0:
+            return torch.zeros((), device=self.ppo_device), torch.zeros((), device=self.ppo_device)
+        pred = self._aaa_step_proxy_forward(obs.detach()[valid], action.detach()[valid])
+        tgt = target.detach()[valid].clamp(0.0, 1.0)
+        loss = torch.mean((pred - tgt) ** 2)
+        self._aaa_step_proxy_opt.zero_grad()
+        loss.backward()
+        if self._aaa_proxy_grad_clip > 0.0:
+            nn.utils.clip_grad_norm_(self._aaa_step_proxy.parameters(), self._aaa_proxy_grad_clip)
+        self._aaa_step_proxy_opt.step()
+        mae = torch.mean(torch.abs(pred.detach() - tgt))
+        return loss.detach(), mae.detach()
+    # === AAA end ===
+
     def play_steps_rnn(self):
         self.set_eval()
         mb_rnn_states = []
@@ -300,7 +362,17 @@ class AMPAgent(common_agent.CommonAgent):
             if _aaa_style_reward.dim() == 1:
                 _aaa_style_reward = _aaa_style_reward.unsqueeze(-1)
             self.experience_buffer.update_data_rnn('style_reward', indices, play_mask, _aaa_style_reward)
+            _aaa_step_norm = infos.get('aaa_cplus_step_width_norm', None)
+            if _aaa_step_norm is None:
+                _aaa_step_norm = torch.full_like(rewards, float('nan'))
+            if _aaa_step_norm.dim() == 1:
+                _aaa_step_norm = _aaa_step_norm.unsqueeze(-1)
+            self.experience_buffer.update_data_rnn('step_width_norm', indices, play_mask, _aaa_step_norm)
             # === AAA end ===
+            # === AAA W4: residual norm 惩罚 ‖Δa‖²（RNN 前向兼容）===
+            _aaa_delta = self.model.a2c_network._last_delta_a
+            _aaa_res_pen = (_aaa_delta ** 2).sum(dim=-1, keepdim=True)
+            self.experience_buffer.update_data_rnn('res_penalty', indices, play_mask, _aaa_res_pen)
             # === AAA end ===
 
             ### ZL
@@ -446,6 +518,12 @@ class AMPAgent(common_agent.CommonAgent):
             if _aaa_style_reward.dim() == 1:
                 _aaa_style_reward = _aaa_style_reward.unsqueeze(-1)
             self.experience_buffer.update_data('style_reward', n, _aaa_style_reward)
+            _aaa_step_norm = infos.get('aaa_cplus_step_width_norm', None)
+            if _aaa_step_norm is None:
+                _aaa_step_norm = torch.full_like(rewards, float('nan'))
+            if _aaa_step_norm.dim() == 1:
+                _aaa_step_norm = _aaa_step_norm.unsqueeze(-1)
+            self.experience_buffer.update_data('step_width_norm', n, _aaa_step_norm)
             # === AAA end ===
             # === AAA W4: residual norm 惩罚 ‖Δa‖²（w4 patch §8.3）===
             # Δa = α·tanh(Δπ) 由 eval_actor 缓存在 _last_delta_a（对应当步 action），这里取算平方和存盘。
@@ -549,6 +627,7 @@ class AMPAgent(common_agent.CommonAgent):
         #   切出 style_advantages，才能和 action_log_probs 对齐。
         dataset_dict['style_advantages'] = batch_dict['style_advantages']
         dataset_dict['style_rewards'] = batch_dict['style_rewards']
+        dataset_dict['step_width_norm'] = batch_dict['step_width_norm']
         # === AAA end ===
         # === AAA end ===
 
@@ -667,11 +746,23 @@ class AMPAgent(common_agent.CommonAgent):
             _style_r = float(batch_dict['style_rewards'].mean()) if 'style_rewards' in batch_dict else float('nan')
             _style_loss = torch_ext.mean_list(train_info.get('aaa_style_actor_loss', [torch.tensor(float('nan'))])).item()
             _contrast_loss = torch_ext.mean_list(train_info.get('aaa_contrast_loss', [torch.tensor(float('nan'))])).item()
+            _proxy_loss = torch_ext.mean_list(train_info.get('aaa_proxy_train_loss', [torch.tensor(float('nan'))])).item()
+            _proxy_mae = torch_ext.mean_list(train_info.get('aaa_proxy_mae', [torch.tensor(float('nan'))])).item()
+            _proxy_dir = torch_ext.mean_list(train_info.get('aaa_proxy_dir_loss', [torch.tensor(float('nan'))])).item()
+            _proxy_gap = torch_ext.mean_list(train_info.get('aaa_proxy_dir_gap', [torch.tensor(float('nan'))])).item()
+            _proxy_ag = torch_ext.mean_list(train_info.get('aaa_proxy_action_grad', [torch.tensor(float('nan'))])).item()
+            _proxy_agmax = torch_ext.mean_list(train_info.get('aaa_proxy_action_grad_max', [torch.tensor(float('nan'))])).item()
+            _joint_loss = torch_ext.mean_list(train_info.get('aaa_joint_step_loss', [torch.tensor(float('nan'))])).item()
+            _joint_gap = torch_ext.mean_list(train_info.get('aaa_joint_step_gap', [torch.tensor(float('nan'))])).item()
             print(f'[AAA probe] Ep{self.epoch_num} alpha={_sa.item():+.5f} grad={_gv:+.3e} '
                   f'r_content={getattr(self,"_probe_r_content",float("nan")):.4f} '
                   f'r_disc={getattr(self,"_probe_r_disc",float("nan")):.4f} '
                   f'r_style={_style_r:.4f} r_respen={getattr(self,"_probe_r_respen",float("nan")):.4f} '
-                  f'style_loss={_style_loss:+.4f} contrast={_contrast_loss:+.4f}', flush=True)
+                  f'style_loss={_style_loss:+.4f} contrast={_contrast_loss:+.4f} '
+                  f'proxy_mse={_proxy_loss:.5f} proxy_mae={_proxy_mae:.5f} '
+                  f'proxy_dir={_proxy_dir:+.5f} proxy_gap={_proxy_gap:+.5f} '
+                  f'proxy_action_grad={_proxy_ag:.5e} proxy_action_grad_max={_proxy_agmax:.5e} '
+                  f'joint_loss={_joint_loss:+.5f} joint_gap={_joint_gap:+.5f}', flush=True)
         # === AAA end ===
         
         return train_info
@@ -776,6 +867,7 @@ class AMPAgent(common_agent.CommonAgent):
         old_action_log_probs_batch = input_dict['old_logp_actions']
         advantage = input_dict['advantages']
         style_advantage = input_dict.get('style_advantages', None)
+        step_width_target = input_dict.get('step_width_norm', None)
         old_mu_batch = input_dict['mu']
         old_sigma_batch = input_dict['sigma']
         return_batch = input_dict['returns']
@@ -836,6 +928,16 @@ class AMPAgent(common_agent.CommonAgent):
             disc_agent_logit = res_dict['disc_agent_logit']
             disc_agent_replay_logit = res_dict['disc_agent_replay_logit']
             disc_demo_logit = res_dict['disc_demo_logit']
+
+            # === AAA W5 P2: train learned step_width proxy on rollout labels ===
+            # 为什么：proxy 必须先拟合真实 rollout step_width_norm，direction loss 才能作为可信的
+            #   可微信号。这里用采样 action 对应的真实标签监督，独立 optimizer 更新 proxy。
+            if step_width_target is not None:
+                proxy_train_loss, proxy_mae = self._aaa_train_step_proxy(obs_batch_processed, actions_batch, step_width_target)
+            else:
+                proxy_train_loss = torch.zeros((), device=self.ppo_device)
+                proxy_mae = torch.zeros((), device=self.ppo_device)
+            # === AAA end ===
 
             if not rnn_masks is None:
                 rnn_mask_bool = rnn_masks.squeeze().bool()
@@ -911,12 +1013,91 @@ class AMPAgent(common_agent.CommonAgent):
                 contrast_kl_loss = torch.zeros((), device=self.ppo_device)
             # === AAA end ===
 
+            # === AAA W5 P2: proxy direction loss ===
+            # 为什么：EMA canary 已证 reward 标量能算对但 sweep 仍 flat；这里用冻结 proxy 直接约束
+            #   同一 obs 下 high slider action 的 predicted step_width 高于 low slider action。
+            _proxy_dir_enabled = self._aaa_proxy_dir_coef > 0.0 and self.epoch_num >= self._aaa_proxy_dir_warmup_epochs
+            if _proxy_dir_enabled and getattr(self.model.a2c_network, 'style_enabled', False):
+                _slider_mid = input_dict['slider'].clone()
+                _slider_low = _slider_mid.clone()
+                _slider_high = _slider_mid.clone()
+                _slider_low[:, self._aaa_contrast_dim] = 0.0
+                _slider_high[:, self._aaa_contrast_dim] = 1.0
+                _sa = self.model.a2c_network.style_alpha
+                _sign = torch.sign(_sa.detach())
+                if torch.abs(_sign).item() < 0.5:
+                    _sign = torch.tensor(-1.0, device=self.ppo_device)
+                _alpha_eff = _sign * torch.clamp(torch.abs(_sa.detach()), min=self._aaa_contrast_alpha_floor)
+                _delta_mid = self.model.a2c_network.eval_style_delta(obs_batch_processed, _slider_mid)
+                _delta_low = self.model.a2c_network.eval_style_delta(obs_batch_processed, _slider_low, alpha_override=_alpha_eff)
+                _delta_high = self.model.a2c_network.eval_style_delta(obs_batch_processed, _slider_high, alpha_override=_alpha_eff)
+                _base_mu = mu - _delta_mid
+                self._aaa_ensure_step_proxy(obs_batch_processed.shape[-1], mu.shape[-1])
+                _prev_requires_grad = [p.requires_grad for p in self._aaa_step_proxy.parameters()]
+                for p in self._aaa_step_proxy.parameters():
+                    p.requires_grad_(False)
+                _pred_low = self._aaa_step_proxy_forward(obs_batch_processed, _base_mu + _delta_low)
+                _pred_high = self._aaa_step_proxy_forward(obs_batch_processed, _base_mu + _delta_high)
+                for p, req in zip(self._aaa_step_proxy.parameters(), _prev_requires_grad):
+                    p.requires_grad_(req)
+                proxy_dir_loss = torch.relu(self._aaa_proxy_margin - (_pred_high - _pred_low)).mean()
+                proxy_dir_gap = (_pred_high - _pred_low).mean()
+                # 诊断 g 是否真的看 action：用 detach 分支测 ∂g/∂action，避免影响 actor 梯度图。
+                _diag_action = (_base_mu + _delta_high).detach().requires_grad_(True)
+                _diag_pred = self._aaa_step_proxy_forward(obs_batch_processed.detach(), _diag_action)
+                _diag_grad = torch.autograd.grad(_diag_pred.mean(), _diag_action, retain_graph=False, create_graph=False)[0]
+                proxy_action_grad = _diag_grad.norm(dim=-1).mean()
+                proxy_action_grad_max = _diag_grad.abs().max()
+            else:
+                proxy_dir_loss = torch.zeros((), device=self.ppo_device)
+                proxy_dir_gap = torch.zeros((), device=self.ppo_device)
+                proxy_action_grad = torch.zeros((), device=self.ppo_device)
+                proxy_action_grad_max = torch.zeros((), device=self.ppo_device)
+            # === AAA end ===
+
+            # === AAA W5 P2b: analytic/action-space step_width direction loss ===
+            # 为什么：naive learned proxy 的 action gradient 接近 0；这里直接让 high step_width slider
+            #   在左右髋部外展代理分数上高于 low slider，给 residual 一条明确动作方向。
+            if self._aaa_joint_step_coef > 0.0 and getattr(self.model.a2c_network, 'style_enabled', False):
+                _slider_mid = input_dict['slider'].clone()
+                _slider_low = _slider_mid.clone()
+                _slider_high = _slider_mid.clone()
+                _slider_low[:, self._aaa_contrast_dim] = 0.0
+                _slider_high[:, self._aaa_contrast_dim] = 1.0
+                _sa = self.model.a2c_network.style_alpha
+                _sign = torch.sign(_sa.detach())
+                if torch.abs(_sign).item() < 0.5:
+                    _sign = torch.tensor(-1.0, device=self.ppo_device)
+                _alpha_eff = _sign * torch.clamp(torch.abs(_sa.detach()), min=self._aaa_contrast_alpha_floor)
+                _delta_mid = self.model.a2c_network.eval_style_delta(obs_batch_processed, _slider_mid)
+                _delta_low = self.model.a2c_network.eval_style_delta(obs_batch_processed, _slider_low, alpha_override=_alpha_eff)
+                _delta_high = self.model.a2c_network.eval_style_delta(obs_batch_processed, _slider_high, alpha_override=_alpha_eff)
+                _base_mu = mu - _delta_mid
+                _a_low = _base_mu + _delta_low
+                _a_high = _base_mu + _delta_high
+                _score_low = (
+                    self._aaa_joint_step_left_sign * _a_low[:, self._aaa_joint_step_left_idx]
+                    + self._aaa_joint_step_right_sign * _a_low[:, self._aaa_joint_step_right_idx]
+                )
+                _score_high = (
+                    self._aaa_joint_step_left_sign * _a_high[:, self._aaa_joint_step_left_idx]
+                    + self._aaa_joint_step_right_sign * _a_high[:, self._aaa_joint_step_right_idx]
+                )
+                joint_step_gap = (_score_high - _score_low).mean()
+                joint_step_loss = torch.relu(self._aaa_joint_step_margin - (_score_high - _score_low)).mean()
+            else:
+                joint_step_loss = torch.zeros((), device=self.ppo_device)
+                joint_step_gap = torch.zeros((), device=self.ppo_device)
+            # === AAA end ===
+
             loss = a_loss + self.critic_coef * c_loss - self.entropy_coef * entropy + self.bounds_loss_coef * b_loss \
                 + self._disc_coef * disc_loss \
                 + self._aaa_style_adv_coef * style_a_loss \
                 + self._aaa_contrast_coef * contrast_loss \
                 + self._aaa_contrast_delta_coef * contrast_delta_loss \
-                + self._aaa_contrast_kl_coef * contrast_kl_loss
+                + self._aaa_contrast_kl_coef * contrast_kl_loss \
+                + self._aaa_proxy_dir_coef * proxy_dir_loss \
+                + self._aaa_joint_step_coef * joint_step_loss
             
             
             a_clip_frac = torch.mean(a_info['actor_clipped'].float())
@@ -927,6 +1108,14 @@ class AMPAgent(common_agent.CommonAgent):
             a_info['aaa_contrast_loss'] = contrast_loss.detach()
             a_info['aaa_contrast_delta_loss'] = contrast_delta_loss.detach()
             a_info['aaa_contrast_kl_loss'] = contrast_kl_loss.detach()
+            a_info['aaa_proxy_train_loss'] = proxy_train_loss.detach()
+            a_info['aaa_proxy_mae'] = proxy_mae.detach()
+            a_info['aaa_proxy_dir_loss'] = proxy_dir_loss.detach()
+            a_info['aaa_proxy_dir_gap'] = proxy_dir_gap.detach()
+            a_info['aaa_proxy_action_grad'] = proxy_action_grad.detach()
+            a_info['aaa_proxy_action_grad_max'] = proxy_action_grad_max.detach()
+            a_info['aaa_joint_step_loss'] = joint_step_loss.detach()
+            a_info['aaa_joint_step_gap'] = joint_step_gap.detach()
             c_info['critic_loss'] = c_loss
 
             if self.multi_gpu:
@@ -1105,6 +1294,9 @@ class AMPAgent(common_agent.CommonAgent):
         # 为什么：style-specific PPO advantage 需要保留 env 侧独立 r_style，不能只依赖已混合的 rewards。
         #   默认 loss coef=0 时只记录不参与优化。
         self.experience_buffer.tensor_dict['style_reward'] = torch.zeros(batch_shape + (1,), device=self.ppo_device)
+        # === AAA W5 P2: proxy supervised target ===
+        # 为什么：learned proxy 需要 rollout 真实 step_width_norm 作监督标签；NaN 表示 C+ 未开启或无标签。
+        self.experience_buffer.tensor_dict['step_width_norm'] = torch.full(batch_shape + (1,), float('nan'), device=self.ppo_device)
         # === AAA end ===
         # === AAA W4: res_penalty buffer（‖Δa‖²，w4 patch §8.3）===
         # 为什么：存每步 ‖Δa‖² 供 reward 合并时减 λ_res·‖Δa‖²（tanh 硬界双保险的 norm 惩罚，抉择2）。
@@ -1122,6 +1314,7 @@ class AMPAgent(common_agent.CommonAgent):
         self.tensor_list += ['amp_obs']
         self.tensor_list += ['slider']  # AAA W4: slider 随 amp_obs 进 batch_dict
         self.tensor_list += ['style_reward']  # AAA W5: r_style 随 rollout 进 batch_dict
+        self.tensor_list += ['step_width_norm']  # AAA W5 P2: proxy 监督标签
         return
 
     def _init_amp_demo_buf(self):

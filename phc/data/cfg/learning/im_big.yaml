@@ -120,6 +120,22 @@ params:
     aaa_contrast_kl_coef: 0.0
     aaa_contrast_alpha_floor: 0.1
     aaa_contrast_dim: 1  # 0=energy, 1=step_width, 2=elbow_bend
+    # === AAA W5 P2: learned differentiable step_width proxy（默认关闭，零回归）===
+    # train_coef 只训练 g(obs, action)->step_width_norm；dir_coef 把单调方向 loss 接入 actor。
+    aaa_proxy_train_coef: 0.0
+    aaa_proxy_dir_coef: 0.0
+    aaa_proxy_lr: 0.001
+    aaa_proxy_hidden: 256
+    aaa_proxy_margin: 0.01
+    aaa_proxy_grad_clip: 1.0
+    aaa_proxy_dir_warmup_epochs: 0
+    # === AAA W5 P2b: analytic/action-space step_width proxy（默认关闭，零回归）===
+    aaa_joint_step_coef: 0.0
+    aaa_joint_step_margin: 0.05
+    aaa_joint_step_left_idx: 0     # SMPL L_Hip_x
+    aaa_joint_step_right_idx: 12   # SMPL R_Hip_x
+    aaa_joint_step_left_sign: 1.0
+    aaa_joint_step_right_sign: -1.0
     # === AAA end ===
 
     player:
