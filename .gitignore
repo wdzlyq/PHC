@@ -141,8 +141,13 @@ checkpoints/
 sample_data/
 # 注意：data/* 已删除——它会误伤 phc/data/cfg/ 和 phc/data/assets/（这些要传）。
 # 如有大数据子目录需忽略，在此精确列出（例：data/amass/）。
+# data/amass 服务器上是软链接到 /root/autodl-tmp/amass，gitignore 目录规则 data/amass/ 不匹配符号链接，
+# 故同时列 data/amass（无尾斜杠）匹配链接本身。
 data/amass/
+data/amass
 data/raw/
+# SMPL 模型文件（.npz/.zip），PHC 运行时下载到 data/smpl/，不进 git。
+data/smpl/
 
 # === 实验输出目录：放开（原 PHC 忽略 output/ log/ out/，我们要用 git 传实验数据）===
 # output/ 由 PHC 用作训练输出 + 预训练 checkpoint 落地，其中 .pt/.pkl 已被上面忽略，
