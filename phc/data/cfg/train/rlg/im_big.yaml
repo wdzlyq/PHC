@@ -103,6 +103,8 @@ params:
     aaa_cplus_target_range: 0.2
     aaa_cplus_signed_style_scale: 10.0
     aaa_cplus_signed_style_clip: 1.0
+    aaa_cplus_direction_reward_w: 0.0
+    aaa_cplus_direction_scale: 0.2
     # === AAA end ===
 
     # === AAA W5: step_width-only 修正计划 loss 开关（默认关闭，零回归）===

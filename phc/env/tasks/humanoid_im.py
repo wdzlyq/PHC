@@ -126,6 +126,8 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
         self._aaa_cplus_step_beta = float(cfg["env"].get("aaa_cplus_step_beta", 10.0))
         self._aaa_cplus_signed_style_scale = float(cfg["env"].get("aaa_cplus_signed_style_scale", 10.0))
         self._aaa_cplus_signed_style_clip = float(cfg["env"].get("aaa_cplus_signed_style_clip", 1.0))
+        self._aaa_cplus_direction_reward_w = float(cfg["env"].get("aaa_cplus_direction_reward_w", 0.0))
+        self._aaa_cplus_direction_scale = float(cfg["env"].get("aaa_cplus_direction_scale", 0.2))
         self._aaa_cplus_step_p10 = float(cfg["env"].get("aaa_cplus_step_p10", 0.15))
         self._aaa_cplus_step_p90 = float(cfg["env"].get("aaa_cplus_step_p90", 0.45))
         self._aaa_cplus_step_axis = int(cfg["env"].get("aaa_cplus_step_axis", 0))
@@ -293,6 +295,18 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
         r_style = self._aaa_cplus_signed_style_scale * (err_origin - err_current)
         if self._aaa_cplus_signed_style_clip > 0.0:
             r_style = torch.clamp(r_style, -self._aaa_cplus_signed_style_clip, self._aaa_cplus_signed_style_clip)
+
+        # === AAA W5 Step 7: physical direction consistency reward ===
+        # 为什么：fixed-positive alpha 诊断把强反向 sweep 压成 flat，说明问题不是单纯 alpha 符号；
+        #   contrast 只让 action 随 slider 变，signed improvement 仍可能被绝对标定误差削弱。
+        # 做什么：按 target-origin 的符号直接奖励真实 step_width_norm 朝同方向移动，保证 slider 排序
+        #   对齐 physical metric 排序；默认权重 0，只有 Step7 canary 显式打开。
+        direction = torch.sign(target - origin)
+        progress = direction * (step_norm - origin)
+        scale = max(self._aaa_cplus_direction_scale, 1e-6)
+        r_direction = torch.clamp(progress / scale, -1.0, 1.0)
+        if self._aaa_cplus_direction_reward_w != 0.0:
+            r_style = r_style + self._aaa_cplus_direction_reward_w * r_direction
         # === AAA end ===
         self.rew_buf[:] += self._aaa_cplus_style_reward_w * r_style
         self._aaa_cplus_last_step_width_norm[:] = step_norm.detach()
@@ -305,9 +319,10 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
             self._aaa_cplus_probe_step += 1
             if self._aaa_cplus_probe_step % 512 == 0:
                 _sn = float(step_norm.mean()); _tg = float(target.mean()); _rs = float(r_style.mean())
+                _rd = float(r_direction.mean())
                 print(f"[AAA cplus] step={self._aaa_cplus_probe_step} step_norm_mean={_sn:.4f} "
                       f"target_mean={_tg:.4f} gap={_sn-_tg:+.4f} r_style_mean={_rs:.4f} "
-                      f"w={self._aaa_cplus_style_reward_w}", flush=True)
+                      f"r_direction_mean={_rd:.4f} w={self._aaa_cplus_style_reward_w}", flush=True)
         # === AAA end ===
 
     # === AAA end ===
