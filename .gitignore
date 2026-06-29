@@ -179,4 +179,9 @@ repro_logs/
 aaa_w5_diag.py
 run_harder_baseline.sh
 data/style/
+# AAA watcher/n ihm 运行副本：正式副本在 AAA 仓 code/scripts/，服务器根目录这些 .sh/.nohup 是 scp/运行副本不进 PHC git。
+# phc/learning/ 下的 .py（aaa_w4_style_sweep.py / gate0_action_response.py）是 run_hydra import 需要的正式副本，要 tracked，不在此列。
+*_watch.sh
+diagA_summary.sh
+*.nohup
 # === AAA end ===
