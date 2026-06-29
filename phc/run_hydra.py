@@ -344,6 +344,16 @@ def main(cfg_hydra: DictConfig) -> None:
         run_sweep(runner, cfg)
         return
 
+    # === AAA Gate-0: action perturbation response test 入口（设计稿 gate0_action_response_design.md）===
+    # 为什么：诊断D 证伪 reward 路径后，codex 最终裁决下一步 = gait-event horizon action perturbation
+    #   response test（不训练、不进梯度，纯 player 模式测 plant 对 action 偏移的物理响应）。
+    # 做什么：cfg 带 aaa_gate0 标志时调 run_gate0 后直接返回；否则原 runner.run(cfg) 不变（零回归）。
+    #   脚本正式副本在 AAA 仓 code/scripts/gate0_action_response.py，服务器/scp 副本在 phc/learning/。
+    if cfg.get("aaa_gate0", False):
+        from learning.gate0_action_response import run_gate0
+        run_gate0(runner, cfg)
+        return
+
     runner.run(cfg)
 
     return
