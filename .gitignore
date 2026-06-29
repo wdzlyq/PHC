@@ -169,4 +169,9 @@ output/
 aaa_w3/
 repro_logs/
 *.bak
+# AAA 运行时副本：正式副本在 AAA 仓（code/scripts/ + data/style/），服务器这份是 scp/训练副本不进 PHC git。
+# 注意只列 data/style/，不要写裸 data/——phc/data/cfg/ 和 phc/data/assets/ 要进 git。
+aaa_w5_diag.py
+run_harder_baseline.sh
+data/style/
 # === AAA end ===
