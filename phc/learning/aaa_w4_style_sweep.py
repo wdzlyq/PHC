@@ -87,6 +87,15 @@ def run_sweep(runner, cfg):
     from learning.im_amp_players import IMAMPPlayerContinuous  # noqa
     from phc.utils.flags import flags
 
+    debug_path = os.environ.get('AAA_SWEEP_DEBUG_PATH')
+    def _debug(msg):
+        if debug_path:
+            with open(debug_path, 'a') as f:
+                f.write(str(msg) + "\n")
+                f.flush()
+
+    _debug("stage=enter_run_sweep")
+
     # ⚠️ body_pos 仅在 flags.im_eval=True 时进 extras（humanoid_im.py:700），故 sweep 期间强制开。
     # cfg.im_eval 由 run_hydra.main 依 cfg 设 flags.im_eval；这里再兜底确保 True。
     flags.im_eval = True
@@ -94,7 +103,9 @@ def run_sweep(runner, cfg):
     load_path = runner.load_path
     print(f"[AAA W4 sweep] restore from {load_path}")
     player = runner.create_player()
+    _debug("stage=player_created")
     player.restore(load_path)
+    _debug("stage=player_restored")
     player.is_determenistic = True
     player.env.is_tensor_obses = True  # IM 训练用 tensor obs
 
@@ -112,6 +123,7 @@ def run_sweep(runner, cfg):
     num_envs = env_task.num_envs
     slider_dim = 6
     print(f"[AAA W4 sweep] num_envs={num_envs} slider_dim={slider_dim}")
+    _debug(f"stage=env_ready num_envs={num_envs}")
 
     # ⚠️ has_batch_dimension 默认 False（rl_games 在 run() 内才设），sweep 不走 run() 故手动设：
     #   num_envs>1 时 obs 带 batch 维，否则 get_action 的 unsqueeze_obs 把 (N,obs) 变 (1,N,obs) 致 _preproc_obs cat 崩。
@@ -123,6 +135,7 @@ def run_sweep(runner, cfg):
     motion_id = cfg.get('aaa_w4_motion_id', None)
     mid, mname = _pick_motion(env_task, motion_key=motion_key, motion_id=motion_id)
     print(f"[AAA W4 sweep] fixed motion id={mid} key={mname}")
+    _debug(f"stage=motion_picked mid={mid} key={mname}")
 
     # slider ladder（5 种）。num_envs 可能 >>5，把 ladder broadcast 到前 5 个 env，
     # 其余 env 用 style0（不参与对比，仅占位保持 batch 维）。
@@ -131,12 +144,15 @@ def run_sweep(runner, cfg):
     n_ladder = min(len(ladder), num_envs)
     slider_override[:n_ladder] = ladder[:n_ladder]
     player._eval_slider_override = slider_override  # player get_action 注入用（commit ee10c3a）
+    _debug("stage=slider_override_set")
 
     # 固定所有 env 到同一 motion（IM 模式 _sampled_motion_ids 是 env→motion 映射，直接覆写）
     # ⚠️ 取模约定见 w4 patch §8.7：_style_table 索引要 %num_unique，但 _sampled_motion_ids 直接赋 motion_id
     #    即可（motion_lib 内部 %num_unique）。赋值后 reset 让 ref state 按该 motion 初始化。
     env_task._sampled_motion_ids[:] = mid
+    _debug("stage=before_env_reset")
     obs_dict = player.env_reset()
+    _debug("stage=after_env_reset")
     # ⚠️ env_reset 可能返回 dict {'obs':...} 或裸 tensor（取决于 wrapper），统一成 dict 供 get_action
     if not isinstance(obs_dict, dict):
         obs_dict = {'obs': obs_dict}
@@ -148,8 +164,10 @@ def run_sweep(runner, cfg):
     num_steps = int(env_task._motion_lib.get_motion_num_steps(torch.tensor([mid], device=device))[0].item())
     max_steps = min(num_steps, int(cfg.get('aaa_w4_max_steps', 300)))
     print(f"[AAA W4 sweep] motion num_steps={num_steps}, rollout max_steps={max_steps}")
+    _debug(f"stage=before_rollout num_steps={num_steps} max_steps={max_steps}")
 
     pred_traj = [[] for _ in range(n_ladder)]  # 每 ladder env 一条轨迹
+    body_pos_source = 'missing'
     with torch.no_grad():
         for n in range(max_steps):
             action = player.get_action(obs_dict, is_determenistic=True)
@@ -158,6 +176,20 @@ def run_sweep(runner, cfg):
                 obs_dict = {'obs': obs_dict}
             # info 即 env extras；body_pos 是当前 sim body 世界坐标 (num_envs, num_bodies, 3)
             body_pos = info.get('body_pos', None)
+            if body_pos is None:
+                # === AAA W5: sweep body_pos fallback ===
+                # 为什么：部分 test/sweep 路径不会把 body_pos 放进 extras，旧脚本会在 np.stack 空轨迹时报错。
+                # 做什么：直接从 env task 的 rigid body tensor 取当前位置，只影响离线 sweep 验收。
+                body_pos = getattr(env_task, '_rigid_body_pos', None)
+                if body_pos is not None:
+                    body_pos_source = '_rigid_body_pos'
+                if body_pos is None:
+                    rb_state = getattr(env_task, '_rigid_body_state', None)
+                    if rb_state is not None:
+                        body_pos = rb_state[..., :3]
+                        body_pos_source = '_rigid_body_state'
+            else:
+                body_pos_source = 'info.body_pos'
             if body_pos is not None:
                 bp = body_pos if torch.is_tensor(body_pos) else torch.as_tensor(body_pos)
                 for i in range(n_ladder):
@@ -167,6 +199,14 @@ def run_sweep(runner, cfg):
             if done.sum() > 0:
                 # 某 env 提前 terminate（fall），其余继续；保持 batch 维，已存轨迹不再追加空帧
                 pass
+
+    if debug_path:
+        with open(debug_path, 'w') as f:
+            f.write(f"motion_id={mid}\n")
+            f.write(f"motion_key={mname}\n")
+            f.write(f"max_steps={max_steps}\n")
+            f.write(f"body_pos_source={body_pos_source}\n")
+            f.write("traj_lengths=" + ",".join(str(len(t)) for t in pred_traj) + "\n")
 
     # 落盘 + 指标
     out_dir = player.config['network_path']
