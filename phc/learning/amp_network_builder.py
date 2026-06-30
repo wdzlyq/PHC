@@ -77,7 +77,9 @@ class AMPBuilder(network_builder.A2CBuilder):
             if self.aaa_residual_mask_mode == 'lower_body' and _aaa_act_dim >= 24:
                 _aaa_mask.zero_()
                 _aaa_mask[:24] = 1.0  # L_Hip(0-2) L_Knee(3-5) L_Ankle(6-8) L_Toe(9-11) R_Hip(12-14) R_Knee(15-17) R_Ankle(18-20) R_Toe(21-23)
-            self.register_buffer('aaa_residual_mask', _aaa_mask)
+            # persistent=False：mask 是固定常量（不学），不进 state_dict，避免旧 ckpt（mask 代码加之前存的）
+            # load 时报 missing key "a2c_network.aaa_residual_mask"。零回归（forward 仍用 self.aaa_residual_mask）。
+            self.register_buffer('aaa_residual_mask', _aaa_mask, persistent=False)
             # === AAA end ===
             for _p in self.actor_mlp.parameters(): _p.requires_grad_(False)
             for _p in self.mu.parameters():         _p.requires_grad_(False)
