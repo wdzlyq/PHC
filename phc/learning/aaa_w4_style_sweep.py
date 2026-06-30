@@ -17,6 +17,113 @@ import torch
 import joblib
 
 
+def _build_structured_direction(env_task, direction_name):
+    # === AAA Step B: fixed structured direction for sweep ===
+    # 为什么：Gate-0 v2 已证明 full D2 与 D2_axis0 有稳定 step_width response；Step B 需要在真实
+    #   slider sweep 中验证持续结构化偏置是否被 PHC tracking 抵消。
+    # 做什么：复用 Gate-0 的方向构造，返回 L2-normalized action direction，避免把 D2 语义重新硬编码。
+    #   fallback：若 gate0 build_directions 不含该方向名（如 D2_axis0_pelvis_sway 是 network buffer 名，
+    #   gate0 只暴露 D0/D1/D2_pelvis_sway/D3），直接用 network 的 aaa_structured_direction buffer
+    #   （= D2_axis0 = L_Hip_x +/R_Hip_x -，与 C1/C3 训练时同一 buffer，保证 Step B↔C3 可比）。
+    try:
+        from learning.gate0_action_response import build_directions
+    except Exception:
+        from gate0_action_response import build_directions
+
+    dof_names = list(env_task._dof_names)
+    dirs = build_directions(dof_names, env_task.num_actions)
+    if direction_name in dirs:
+        idx, signs = dirs[direction_name]
+        vec = torch.zeros(env_task.num_actions, device=env_task.device)
+        for j, di in enumerate(idx):
+            vec[di] = float(signs[j])
+        nrm = vec.norm()
+        if nrm > 0:
+            vec = vec / nrm
+        return vec, idx, signs
+    # fallback: 用 network 的 aaa_structured_direction buffer（D2_axis0）
+    net = getattr(env_task, '_aaa_net_ref', None)
+    if net is None:
+        # player 注入 hook 时 env_task 上可能没 net ref；尝试从 player 拿
+        pass
+    buf = None
+    try:
+        buf = env_task._aaa_structured_direction_buffer  # 由 run_sweep 在 hook 前注入
+    except Exception:
+        buf = None
+    if buf is None:
+        raise RuntimeError(f"structured direction {direction_name} not found in gate0 dirs "
+                           f"(available={list(dirs.keys())}) and no network buffer fallback injected")
+    vec = buf.to(env_task.device).clone()
+    nrm = vec.norm()
+    if nrm > 0:
+        vec = vec / nrm
+    # idx/signs 仅用于打印，从非零位置反推
+    nz = torch.nonzero(vec, as_tuple=False).flatten().tolist()
+    idx = nz
+    signs = [float(vec[i]) for i in nz]
+    return vec, idx, signs
+
+
+def _foot_body_ids(env_task):
+    body_names = env_task._body_names
+    foot_keys = ['left_ankle', 'right_ankle', 'L_Ankle', 'R_Ankle']
+    ids = [body_names.index(n) for n in body_names if any(k in n for k in foot_keys)]
+    if len(ids) < 2 and hasattr(env_task, '_aaa_cplus_step_width_body_ids'):
+        ids = [int(env_task._aaa_cplus_step_width_body_ids[0]), int(env_task._aaa_cplus_step_width_body_ids[1])]
+    return ids[:2]
+
+
+def install_structured_step_hook(player, env_task, slider_override, direction_vec, amp, origin, phase_gate, contact_thr):
+    # === AAA Step B: fixed mapping mu offset ===
+    # 为什么：不训练 69D residual，先验证 Gate-0 找到的 D2/D2_axis0 结构化方向能否在真实 sweep 中
+    #   产生可见且 content 不崩的 step_width 控制。
+    # 做什么：b = amp*(slider_step_width-origin)，每帧在 actor mu 上加 phase_gate*b*direction_vec。
+    foot_ids = _foot_body_ids(env_task)
+
+    def phase_scale():
+        if phase_gate == 'none':
+            return torch.ones(env_task.num_envs, 1, device=env_task.device)
+        contact = torch.norm(env_task._contact_forces[:, foot_ids, :], dim=-1)
+        if phase_gate == 'stance_left':
+            active = contact[:, 0] >= contact_thr
+        elif phase_gate == 'stance_any':
+            active = (contact >= contact_thr).any(dim=-1)
+        elif phase_gate == 'swing_left':
+            active = contact[:, 0] < contact_thr
+        else:
+            raise RuntimeError(f"unknown phase_gate={phase_gate}")
+        return active.float().unsqueeze(-1)
+
+    def patched_get_action(obs_dict, is_determenistic=False):
+        from rl_games.common.tr_helpers import unsqueeze_obs
+        obs = obs_dict['obs']
+        if player.has_batch_dimension == False:
+            obs = unsqueeze_obs(obs)
+        obs = player._preproc_obs(obs)
+        input_dict = {
+            'is_train': False,
+            'prev_actions': None,
+            'obs': obs,
+            'rnn_states': player.states,
+            'slider': slider_override,
+        }
+        with torch.no_grad():
+            res_dict = player.model(input_dict)
+        mu = res_dict['mus']
+        bias = amp * (slider_override[:, 1:2] - origin)
+        mu = mu + phase_scale() * bias * direction_vec.view(1, -1)
+        current_action = mu
+        if player.has_batch_dimension == False:
+            current_action = torch.squeeze(current_action.detach())
+        if player.clip_actions:
+            from phc.learning.amp_players import rescale_actions
+            return rescale_actions(player.actions_low, player.actions_high, torch.clamp(current_action, -1.0, 1.0))
+        return current_action
+
+    player.get_action = patched_get_action
+
+
 def _pick_motion(env_task, motion_key=None, motion_id=None):
     # === AAA W4: 选定固定内容 motion（验收要"同一 motion 切 slider"）===
     # motion_lib._motion_data_keys 是 np.array[str]，下标 = motion_id（0..num_unique-1）
@@ -146,6 +253,36 @@ def run_sweep(runner, cfg):
     player._eval_slider_override = slider_override  # player get_action 注入用（commit ee10c3a）
     _debug("stage=slider_override_set")
 
+    structured_step = bool(cfg.get('aaa_structured_step_sweep', False))
+    structured_info = None
+    if structured_step:
+        # === AAA Step B: bypass learned adapter for fixed structured canary ===
+        # 为什么：Step B 验证结构化 action direction 本身，不混入已知 flat/不稳的 learned residual。
+        # 做什么：style_alpha=0 退化 base actor，再由 install_structured_step_hook 加固定 D2_axis0 偏置。
+        player.model.a2c_network.style_alpha.data.fill_(0.0)
+        direction_name = cfg.get('aaa_structured_direction', 'D2_axis0_pelvis_sway')
+        amp = float(cfg.get('aaa_structured_amp', 0.2))
+        origin = float(cfg.get('aaa_structured_origin', 0.5))
+        phase_gate = cfg.get('aaa_structured_phase_gate', 'stance_left')
+        contact_thr = float(cfg.get('aaa_structured_contact_thr', 1.0))
+        # 注入 network 的 aaa_structured_direction buffer（D2_axis0）作 fallback，供 _build_structured_direction 使用
+        # 为什么：gate0 build_directions 不暴露 D2_axis0（只有 D2_pelvis_sway 全轴）；Step B 必须用与 C1/C3
+        #   训练时同一的 D2_axis0 buffer（L_Hip_x +/R_Hip_x -）保证可比。
+        if hasattr(player.model, 'a2c_network') and hasattr(player.model.a2c_network, 'aaa_structured_direction'):
+            env_task._aaa_structured_direction_buffer = player.model.a2c_network.aaa_structured_direction.detach().cpu()
+        direction_vec, direction_idx, direction_signs = _build_structured_direction(env_task, direction_name)
+        install_structured_step_hook(player, env_task, slider_override, direction_vec, amp, origin, phase_gate, contact_thr)
+        structured_info = {
+            'direction': direction_name,
+            'direction_idx': list(map(int, direction_idx)),
+            'direction_signs': [float(x) for x in direction_signs],
+            'amp': amp,
+            'origin': origin,
+            'phase_gate': phase_gate,
+            'contact_thr': contact_thr,
+        }
+        print(f"[AAA structured sweep] enabled {structured_info}")
+
     # 固定所有 env 到同一 motion（IM 模式 _sampled_motion_ids 是 env→motion 映射，直接覆写）
     # ⚠️ 取模约定见 w4 patch §8.7：_style_table 索引要 %num_unique，但 _sampled_motion_ids 直接赋 motion_id
     #    即可（motion_lib 内部 %num_unique）。赋值后 reset 让 ref state 按该 motion 初始化。
@@ -167,6 +304,16 @@ def run_sweep(runner, cfg):
     _debug(f"stage=before_rollout num_steps={num_steps} max_steps={max_steps}")
 
     pred_traj = [[] for _ in range(n_ladder)]  # 每 ladder env 一条轨迹
+    reward_traj = [[] for _ in range(n_ladder)]
+    done_count = [0 for _ in range(n_ladder)]
+    # === AAA P1: 正式 content 指标逐帧捕获（doc 24 §3 P1）===
+    # 为什么：codex P1 要求 MPJPE/root tracking/root speed drift/SR/fall/residual norm；现有 sweep 只存 body_pos+reward。
+    #   flags.im_eval=True 时 env extras 已含 mpjpe(逐 env 标量) + body_pos_gt(ref 全身) + _terminate_buf(fall 判定)，
+    #   这里只补捕获，不改 env。gt 只存 pelvis(root tracking/root speed drift 用)，省内存。
+    # 做什么：每帧每 ladder env 存 mpjpe 标量 + gt_pelvis(3,) + terminate 标志；structured bias norm 离线由 amp/origin/slider 算。
+    mpjpe_traj = [[] for _ in range(n_ladder)]
+    gt_pelvis_traj = [[] for _ in range(n_ladder)]
+    terminate_traj = [[] for _ in range(n_ladder)]
     body_pos_source = 'missing'
     with torch.no_grad():
         for n in range(max_steps):
@@ -176,6 +323,9 @@ def run_sweep(runner, cfg):
                 obs_dict = {'obs': obs_dict}
             # info 即 env extras；body_pos 是当前 sim body 世界坐标 (num_envs, num_bodies, 3)
             body_pos = info.get('body_pos', None)
+            # P1 指标来源（flags.im_eval=True 时存在，见 humanoid_im.py:872-874）
+            mpjpe_t = info.get('mpjpe', None)            # (num_envs,) tensor
+            body_pos_gt = info.get('body_pos_gt', None)  # (num_envs, num_bodies, 3) ndarray
             if body_pos is None:
                 # === AAA W5: sweep body_pos fallback ===
                 # 为什么：部分 test/sweep 路径不会把 body_pos 放进 extras，旧脚本会在 np.stack 空轨迹时报错。
@@ -192,8 +342,21 @@ def run_sweep(runner, cfg):
                 body_pos_source = 'info.body_pos'
             if body_pos is not None:
                 bp = body_pos if torch.is_tensor(body_pos) else torch.as_tensor(body_pos)
+                # terminate_buf：>0 表示该 env 已 fall（_terminate_buf 在 compute_humanoid_im_reset 里置位）
+                term_buf = getattr(env_task, '_terminate_buf', None)
                 for i in range(n_ladder):
                     pred_traj[i].append(bp[i].detach().cpu().numpy())
+                    reward_traj[i].append(float(r[i]))
+                    if done[i] > 0.5:
+                        done_count[i] += 1
+                    # P1 指标逐帧存（mpjpe 标量 + gt pelvis + terminate 标志）
+                    if mpjpe_t is not None:
+                        mt = mpjpe_t[i] if torch.is_tensor(mpjpe_t) else mpjpe_t[i]
+                        mpjpe_traj[i].append(float(mt.detach().cpu() if torch.is_tensor(mt) else mt))
+                    if body_pos_gt is not None:
+                        gt_pelvis_traj[i].append(np.asarray(body_pos_gt[i][0, :3]))  # pelvis only
+                    if term_buf is not None:
+                        terminate_traj[i].append(int(term_buf[i].item() > 0.5))
             # 不调 _post_step：它会按 138 motion 切片 + forward_motion_samples + 落 failed.pkl，
             # 与"固定单 motion sweep"冲突。sweep 只需 body_pos，已直接从 info 取。
             if done.sum() > 0:
@@ -217,6 +380,14 @@ def run_sweep(runner, cfg):
         'slider_labels': labels[:n_ladder],
         'slider_ladder': ladder[:n_ladder].cpu().numpy(),
         'pred_traj': [np.stack(t) for t in pred_traj],  # list of (T, num_bodies, 3)
+        'structured_step': structured_info,
+        # === AAA P1: 正式 content 指标（doc 24 §3 P1）===
+        'mpjpe_traj': [np.asarray(t) for t in mpjpe_traj],          # list of (T,)
+        'gt_pelvis_traj': [np.stack(t) if len(t) else np.zeros((0, 3)) for t in gt_pelvis_traj],  # list of (T,3)
+        'terminate_traj': [np.asarray(t) for t in terminate_traj],   # list of (T,) int {0,1}
+        'reward_traj': [np.asarray(t) for t in reward_traj],         # list of (T,)
+        'motion_num_steps': int(num_steps),
+        'max_steps': int(max_steps),
     }
     joblib.dump(result, sweep_out, compress=True)
     print(f"[AAA W4 sweep] dumped {sweep_out}")
@@ -224,10 +395,11 @@ def run_sweep(runner, cfg):
     # 客观指标表
     print("=" * 78)
     print(f"[AAA W4 sweep] metrics (motion={mname})  — 各 slider 列指标应有方向性差异")
-    print(f"{'slider':<16}{'root_z_std':>12}{'step_width':>14}{'elbow_rom':>12}{'root_speed':>14}")
+    print(f"{'slider':<16}{'root_z_std':>12}{'step_width':>14}{'elbow_rom':>12}{'root_speed':>14}{'rew_mean':>12}{'done':>8}")
     for i in range(n_ladder):
         mp = _joint_amplitude_metrics(result['pred_traj'][i])
-        print(f"{labels[i]:<16}{mp['root_z_std']:>12.4f}{mp['step_width']:>14.4f}{mp['elbow_rom']:>12.2f}{mp['root_speed']:>14.4f}")
+        rew_mean = float(np.mean(reward_traj[i])) if reward_traj[i] else float('nan')
+        print(f"{labels[i]:<16}{mp['root_z_std']:>12.4f}{mp['step_width']:>14.4f}{mp['elbow_rom']:>12.2f}{mp['root_speed']:>14.4f}{rew_mean:>12.4f}{done_count[i]:>8d}")
     print("=" * 78)
     print("[AAA W4 sweep] done.")
     return result
