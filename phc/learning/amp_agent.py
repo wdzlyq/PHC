@@ -130,6 +130,15 @@ class AMPAgent(common_agent.CommonAgent):
         self._aaa_g_local_path = str(config.get('aaa_g_local_path', ''))
         self._aaa_g_local_feature_mode = str(config.get('aaa_g_local_feature_mode', 'obs_delta'))
         self._aaa_g_local_grad_clip = float(config.get('aaa_g_local_grad_clip', 0.0))
+        # === AAA C-option: g_local supervision carrier 选择（default-off 零回归，plan §11.11）===
+        # 为什么：§11.6 codex 拒 C 核心理由——当前 g_local 数据是 D2_axis0/action-delta 分布，直接监督
+        #   masked 24D style_residual 是 action-delta OOD。要做 C 必须先采 lower-body perturbation dataset
+        #   训 g_local_lower_body（run_sample_glocal_lower_body.sh），再用 lower_body carrier 把 g_local
+        #   监督经 masked style_residual 回传，解决 masked→structured 链 supervision confound。
+        # 做什么：carrier='structured'（默认）= 现有 eval_structured_delta（scalar→固定 D2_axis0，零回归）；
+        #   carrier='lower_body' = 改调 eval_style_delta（masked style_residual，需配 aaa_residual_mask_mode=lower_body
+        #   + g_local_lower_body.pt）。default 'structured' 保证 C3 复现不变。
+        self._aaa_g_local_carrier = str(config.get('aaa_g_local_carrier', 'structured'))
         self._aaa_g_local = None          # 冻结的 AAALocalResponseMLP，懒加载
         self._aaa_g_local_stats = None    # dict: obs_mean/std/delta_scale/y_mean/y_std/delta_start/...
         # === AAA end ===
@@ -1270,10 +1279,27 @@ class AMPAgent(common_agent.CommonAgent):
                 _gl_slider_high = _gl_slider_mid.clone()
                 _gl_slider_low[:, self._aaa_contrast_dim] = 0.0
                 _gl_slider_high[:, self._aaa_contrast_dim] = 1.0
-                _gl_delta_low = _net.eval_structured_delta(
-                    obs_batch_processed, _gl_slider_low, amp_override=self._aaa_structured_step_amp)
-                _gl_delta_high = _net.eval_structured_delta(
-                    obs_batch_processed, _gl_slider_high, amp_override=self._aaa_structured_step_amp)
+                # === AAA C-option: g_local carrier 分支（plan §11.11，default structured 零回归）===
+                # structured（默认）= eval_structured_delta（scalar→固定 D2_axis0，C3 复现不变）
+                # lower_body = eval_style_delta（masked style_residual，需 mask_mode=lower_body +
+                #   g_local_lower_body.pt，解决 masked→structured 链 supervision confound）。
+                # lower_body 复用 contrast 的 _alpha_eff（sign×clamp(|α|, alpha_floor)）确保 α 太小时
+                #   style_residual 仍有有效梯度；与 contrast supervision（amp_agent.py:1128）同款 alpha_override。
+                if self._aaa_g_local_carrier == 'lower_body' and hasattr(_net, 'eval_style_delta'):
+                    _sa = _net.style_alpha
+                    _sign = torch.sign(_sa.detach())
+                    if torch.abs(_sign).item() < 0.5:
+                        _sign = torch.tensor(-1.0, device=self.ppo_device)
+                    _alpha_eff = _sign * torch.clamp(torch.abs(_sa.detach()), min=self._aaa_contrast_alpha_floor)
+                    _gl_delta_low = _net.eval_style_delta(
+                        obs_batch_processed, _gl_slider_low, alpha_override=_alpha_eff)
+                    _gl_delta_high = _net.eval_style_delta(
+                        obs_batch_processed, _gl_slider_high, alpha_override=_alpha_eff)
+                else:
+                    _gl_delta_low = _net.eval_structured_delta(
+                        obs_batch_processed, _gl_slider_low, amp_override=self._aaa_structured_step_amp)
+                    _gl_delta_high = _net.eval_structured_delta(
+                        obs_batch_processed, _gl_slider_high, amp_override=self._aaa_structured_step_amp)
                 # g_local 训练在 Gate-0 raw onset_obs 上（env_reset 原始，未 RMS 归一），故喂 raw obs_batch，
                 # g_local 内部用自己的 dataset obs_mean/std 归一；不能用 obs_batch_processed（agent RMS 归一）。
                 _gl_pred_low = self._aaa_g_local_forward(obs_batch, _gl_delta_low)

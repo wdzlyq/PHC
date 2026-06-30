@@ -155,6 +155,7 @@ params:
     aaa_g_local_margin: 0.03
     aaa_g_local_path: ""
     aaa_g_local_feature_mode: obs_delta
+    aaa_g_local_carrier: structured # structured=eval_structured_delta(默认零回归); lower_body=eval_style_delta(C选项)
     aaa_g_local_grad_clip: 0.0
     # === AAA end ===
 

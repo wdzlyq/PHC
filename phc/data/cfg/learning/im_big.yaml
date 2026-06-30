@@ -154,6 +154,7 @@ params:
     aaa_g_local_margin: 0.03        # 初始小于 C2 target margin 0.05，避免过强（plan §686）
     aaa_g_local_path: ""            # 指向 g_local_mlp.pt（obs_delta 版）
     aaa_g_local_feature_mode: obs_delta
+    aaa_g_local_carrier: structured # structured=eval_structured_delta(scalar→D2_axis0,默认零回归); lower_body=eval_style_delta(masked style_residual, C选项,需 mask_mode=lower_body+g_local_lower_body.pt)
     aaa_g_local_grad_clip: 0.0      # 默认不单独裁剪，先看 grad audit
     # === AAA end ===
 
