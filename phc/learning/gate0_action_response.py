@@ -53,6 +53,15 @@ def build_directions(dof_names, num_actions):
                 out.extend([j * 3, j * 3 + 1, j * 3 + 2])
             return out
         return list(joint_idx_list)
+    def joint_axis_to_action_idx(joint_idx_list, axis):
+        # === AAA Gate-0 v2: D2 axis split ===
+        # 为什么：full D2 同时扰动 SMPL hip 的 3 个 axis-angle 维，不能在论文中直接解释成
+        #   hip_abduction 或 pelvis translation。分轴测试能定位真正有效的 action axis。
+        # 做什么：SMPL joint×3 模式下返回指定 axis 的 action 维；dof 级机器人没有 axis-angle 结构，
+        #   因此不构造 D2x/D2y/D2z，避免错误解释。
+        if not smpl_mode:
+            return []
+        return [j * 3 + axis for j in joint_idx_list]
     def find_joints(keys):
         return [i for i, n in enumerate(dof_names) if any(k in n for k in keys)]
 
@@ -79,6 +88,14 @@ def build_directions(dof_names, num_actions):
         idx_l = joint_to_action_idx(L_hip); idx_r = joint_to_action_idx(R_hip)
         dirs['D2_pelvis_sway'] = (idx_l + idx_r,
                                   [+1.0] * len(idx_l) + [-1.0] * len(idx_r))
+        for axis in range(3):
+            idx_l_axis = joint_axis_to_action_idx(L_hip, axis)
+            idx_r_axis = joint_axis_to_action_idx(R_hip, axis)
+            if idx_l_axis and idx_r_axis:
+                dirs[f'D2_axis{axis}_pelvis_sway'] = (
+                    idx_l_axis + idx_r_axis,
+                    [+1.0] * len(idx_l_axis) + [-1.0] * len(idx_r_axis),
+                )
     # D3: ankle lateral proxy（左右踝同向 → 触地横向位置）
     if L_ankle and R_ankle:
         idx = joint_to_action_idx(L_ankle + R_ankle)
@@ -187,7 +204,7 @@ def run_gate0(runner, cfg):
     motion_ids = [int(x) for x in os.environ.get('AAA_GATE0_MOTION_IDS', '29,13').split(',')]
     dir_keys_env = os.environ.get('AAA_GATE0_DIRECTIONS', '')  # 空=全部候选
     dir_keys = [k.strip() for k in dir_keys_env.split(',') if k.strip()] if dir_keys_env else None
-    deltas = [float(x) for x in os.environ.get('AAA_GATE0_DELTAS', '0.025,0.05,0.10').split(',')]  # 开放点#3
+    deltas = [float(x) for x in os.environ.get('AAA_GATE0_DELTAS', '0.025,0.05,0.10,0.15,0.20').split(',')]  # Step A scoped
     signs = [+1.0, -1.0]
     repeats = int(os.environ.get('AAA_GATE0_REPEATS', '8'))  # 每 condition 采样数（开放点#1/4）
     contact_thr = float(os.environ.get('AAA_GATE0_CONTACT_THR', '1.0'))  # 开放点#2 foot contact force 阈值(N)
@@ -196,6 +213,17 @@ def run_gate0(runner, cfg):
     sign_acc_thr = float(os.environ.get('AAA_GATE0_SIGN_ACC_THR', '0.75'))  # 开放点#5
     effect_thr_mult = float(os.environ.get('AAA_GATE0_EFFECT_THR_MULT', '3.0'))  # 开放点#5
     noise_floor = float(os.environ.get('AAA_GATE0_NOISE_FLOOR', '0.0017'))  # 诊断D motion13 range 作噪声底
+    output_name = os.environ.get('AAA_GATE0_OUTPUT_NAME', 'gate0_v2_response.json')
+    save_tensors = os.environ.get('AAA_GATE0_SAVE_TENSORS', '0') == '1'
+    tensor_output_name = os.environ.get('AAA_GATE0_TENSOR_OUTPUT_NAME', 'gate0_v2_pairs.pt')
+    # === AAA P2 strict clone: 严格同初态复验（default off 零回归，plan §654/§830/§919 漏洞）===
+    # 为什么：v1 baseline/pert 各自 env_reset → _motion_start_times per-env 独立采样 → 不同 onset phase，
+    #   Δsw 含 phase 噪声（仅靠 repeats 平均 + stance/swing 分桶缓解）。strict clone = reset 后把 pert env
+    #   sim state 拷到 baseline env，使两者从完全相同初态出发，唯一差异是 pert 的 action offset。
+    # 做什么：AAA_GATE0_STRICT_CLONE=1 时，reset 后对每 pair(baseline=2ci, pert=2ci+1) 拷 _motion_start_times
+    #   + _humanoid_root_states + _dof_pos + _dof_vel 到 baseline，set_*_tensor_indexed 写回 sim，refresh。
+    strict_clone = os.environ.get('AAA_GATE0_STRICT_CLONE', '0') == '1'
+    print(f"[AAA Gate-0] strict_clone_state={strict_clone}")
 
     flags.im_eval = True  # body_pos 进 extras（同 sweep）
     load_path = runner.load_path
@@ -276,6 +304,7 @@ def run_gate0(runner, cfg):
 
     # 收集样本
     samples = []  # list of dict per (cond, repeat)
+    tensor_rows = []  # Step C2: bounded paired perturbation dataset for g_local
 
     # offset tensor 需按 condition 建（每 condition 一个 delta/dir/sign），但一次 rollout 多 condition 并行
     # → offset tensor per env 由其 condition 决定。重复 repeats 次 reset。
@@ -290,6 +319,49 @@ def run_gate0(runner, cfg):
             obs_dict = {'obs': obs_dict}
         if 'obs' not in obs_dict:
             obs_dict = {'obs': obs_dict[list(obs_dict)[0]]}
+        # === AAA P2 strict clone: reset 后把 pert env sim state 拷到 baseline env（严格同初态）===
+        # 为什么：v1 baseline/pert 独立 reset → _motion_start_times 不同 → onset phase 不同 → Δsw 含 phase 噪声。
+        #   strict clone 让两者从完全相同初态出发，唯一差异是 pert 的 action offset（plan §654/§830/§919）。
+        # 做什么：对每 pair(baseline=2ci, pert=2ci+1)，拷 pert 的 _motion_start_times + _humanoid_root_states
+        #   + _dof_pos + _dof_vel 到 baseline；set_actor_root_state_tensor_indexed + set_dof_state_tensor_indexed
+        #   写回 sim；refresh_sim_tensors 同步 rigid body。然后重算 baseline obs（obs_dict['obs'] 取 baseline 行）。
+        # ⚠️ rigid_body_state 无直接 set API，但 reset 后 _refresh_sim_tensors 会从 root+dof 重建，clone root+dof 足够同初态。
+        if strict_clone:
+            from isaacgym import gymtorch
+            base_ids = torch.tensor([2 * ci for ci in range(n_cond)], dtype=torch.long, device=device)
+            pert_ids = torch.tensor([2 * ci + 1 for ci in range(n_cond)], dtype=torch.long, device=device)
+            # 1) ref motion 同步：_motion_start_times / _motion_start_times_offset / _sampled_motion_ids / progress_buf
+            env_task._motion_start_times[base_ids] = env_task._motion_start_times[pert_ids]
+            env_task._motion_start_times_offset[base_ids] = env_task._motion_start_times_offset[pert_ids]
+            env_task._sampled_motion_ids[base_ids] = env_task._sampled_motion_ids[pert_ids]
+            env_task.progress_buf[base_ids] = env_task.progress_buf[pert_ids]
+            if hasattr(env_task, '_global_offset'):
+                env_task._global_offset[base_ids] = env_task._global_offset[pert_ids]
+            # 2) sim state: root + dof（_set_env_state 内部就是写这些 tensor）
+            env_task._humanoid_root_states[base_ids] = env_task._humanoid_root_states[pert_ids]
+            env_task._dof_pos[base_ids] = env_task._dof_pos[pert_ids]
+            env_task._dof_vel[base_ids] = env_task._dof_vel[pert_ids]
+            # 3) 写回 sim（_reset_env_tensors 同款 API，indexed 到 baseline actor ids）
+            base_actor_ids = env_task._humanoid_actor_ids[base_ids].to(torch.int32)
+            env_task.gym.set_actor_root_state_tensor_indexed(
+                env_task.sim, gymtorch.unwrap_tensor(env_task._root_states),
+                gymtorch.unwrap_tensor(base_actor_ids), len(base_actor_ids))
+            env_task.gym.set_dof_state_tensor_indexed(
+                env_task.sim, gymtorch.unwrap_tensor(env_task._dof_state),
+                gymtorch.unwrap_tensor(base_actor_ids), len(base_actor_ids))
+            env_task._refresh_sim_tensors()
+            # 4) 重算 baseline obs（obs 已因 state 改变失效；用 _compute_observations 刷新 base_ids）
+            with torch.no_grad():
+                env_task._compute_observations(base_ids)
+                obs_dict['obs'][base_ids] = env_task.obs_buf[base_ids]
+            _debug(f"stage=strict_clone_done rep={rep} pairs={n_cond}")
+        # === AAA end ===
+        # === AAA Step C2: cache onset observations for local response proxy dataset ===
+        # 为什么：C2 的 g_local 需要 (obs, action_delta, phase)->event Δstep_width 监督；
+        #   Gate-0 已经有受控 action perturbation 与 event label，是最便宜的数据源。
+        # 做什么：保存 reset/onset 时的 raw obs；训练脚本再做标准化。注意当前 v1 baseline/pert
+        #   尚非严格 clone-state，本数据先作 C2-min surrogate，后续再升级 strict clone。
+        onset_obs = obs_dict['obs'].detach().clone()
         # 记录 onset phase（per env，用 motion_length 归一）
         onset_phase = {}
         with torch.no_grad():
@@ -309,6 +381,7 @@ def run_gate0(runner, cfg):
         # contact_forces 在 reset 后可用
         cf = env_task._contact_forces
         onset_contact = _foot_contact(cf, foot_body_ids)  # (N, 2) per env
+        root_onset = env_task._rigid_body_pos[:, 0, :].clone()
 
         # 建 offset tensor：每 env 按其 condition 的 (dir, sign, delta)
         offset = torch.zeros(num_envs, num_actions, device=device)
@@ -324,6 +397,7 @@ def run_gate0(runner, cfg):
             if nrm > 0:
                 vec = vec / nrm
             offset[ei] = sign * d * vec
+        offset_cpu = offset.detach().cpu()
 
         # 安装 hook（每 rep 重装，offset 变了）
         install_action_offset_hook(player, offset)
@@ -345,6 +419,10 @@ def run_gate0(runner, cfg):
         fallen = {ei: False for ei in pert_envs}
         sw_pert = {ci: None for ci in range(n_cond)}
         base_sw_traj = {ci: [] for ci in range(n_cond)}  # baseline env(=2*ci) 每步 step_width
+        base_rew_traj = {ci: [] for ci in range(n_cond)}
+        pert_rew_traj = {ci: [] for ci in range(n_cond)}
+        base_root_disp_traj = {ci: [] for ci in range(n_cond)}
+        pert_root_disp_traj = {ci: [] for ci in range(n_cond)}
         with torch.no_grad():
             for step in range(max_event_steps):
                 action = player.get_action(obs_dict, is_determenistic=True)
@@ -357,7 +435,20 @@ def run_gate0(runner, cfg):
                 contact = _foot_contact(cf, foot_body_ids)  # (N, 2)
                 # 存 baseline env step_width（env 2*ci，与 pert env 2*ci+1 同初态同 start_time）
                 for ci in range(n_cond):
-                    base_sw_traj[ci].append(float(sw_all[2 * ci]))
+                    ei_b = 2 * ci
+                    ei_p = 2 * ci + 1
+                    base_sw_traj[ci].append(float(sw_all[ei_b]))
+                    # === AAA Gate-0 v2: content/root proxy under perturbation ===
+                    # 为什么：Gate-0 v1 只证明 step_width response；但 expC 已显示 style 信号变强可能
+                    #   伴随 content 崩坏。Step A scoped 必须同时记录安全代价，供 Step B 选相位/幅度。
+                    # 做什么：记录 baseline/pert 同步步的 reward proxy 和 root displacement proxy；
+                    #   后续在 event 帧汇总 reward_diff/root_disp_diff。
+                    base_rew_traj[ci].append(float(r[ei_b]))
+                    pert_rew_traj[ci].append(float(r[ei_p]))
+                    root_now_b = env_task._rigid_body_pos[ei_b, 0, :]
+                    root_now_p = env_task._rigid_body_pos[ei_p, 0, :]
+                    base_root_disp_traj[ci].append(float(torch.norm(root_now_b - root_onset[ei_b])))
+                    pert_root_disp_traj[ci].append(float(torch.norm(root_now_p - root_onset[ei_p])))
                 # 检查 pert env 的 gait event
                 for ei in pert_envs:
                     ci = (ei - 1) // 2  # pert env = 2*ci+1
@@ -382,12 +473,27 @@ def run_gate0(runner, cfg):
 
         # sw_base[ci] = baseline env 在 T_event[ci] 帧的 step_width（v1 非严格同初态，见上注）
         sw_base = {}
+        rew_base = {}
+        rew_pert = {}
+        root_disp_base = {}
+        root_disp_pert = {}
+        event_timeout = {}
         for ci in range(n_cond):
             te = T_event[ci]
             if te is not None and 0 < te <= len(base_sw_traj[ci]):
                 sw_base[ci] = base_sw_traj[ci][te - 1]
+                rew_base[ci] = float(np.mean(base_rew_traj[ci][:te])) if base_rew_traj[ci] else None
+                rew_pert[ci] = float(np.mean(pert_rew_traj[ci][:te])) if pert_rew_traj[ci] else None
+                root_disp_base[ci] = base_root_disp_traj[ci][te - 1] if base_root_disp_traj[ci] else None
+                root_disp_pert[ci] = pert_root_disp_traj[ci][te - 1] if pert_root_disp_traj[ci] else None
+                event_timeout[ci] = False
             else:
                 sw_base[ci] = None
+                rew_base[ci] = None
+                rew_pert[ci] = None
+                root_disp_base[ci] = None
+                root_disp_pert[ci] = None
+                event_timeout[ci] = True
 
         # 收本 rep 样本
         for ci in range(n_cond):
@@ -399,10 +505,44 @@ def run_gate0(runner, cfg):
                 'onset_phase': onset_phase[ei_p],
                 'onset_stance': bool(onset_f0[ei_p] >= contact_thr),
                 'T_event': te,
+                'event_timeout': event_timeout[ci],
                 'fall': fallen[ei_p],
                 'sw_pert': sw_pert[ci],
                 'sw_base': sw_base[ci],
+                'reward_base_mean': rew_base[ci],
+                'reward_pert_mean': rew_pert[ci],
+                'reward_diff': (rew_pert[ci] - rew_base[ci]) if rew_pert[ci] is not None and rew_base[ci] is not None else None,
+                'root_disp_base': root_disp_base[ci],
+                'root_disp_pert': root_disp_pert[ci],
+                'root_disp_diff': (root_disp_pert[ci] - root_disp_base[ci]) if root_disp_pert[ci] is not None and root_disp_base[ci] is not None else None,
             })
+            if save_tensors:
+                # Store both valid and invalid rows with validity flags; train script filters.
+                sw_base_ci = sw_base[ci]
+                sw_pert_ci = sw_pert[ci]
+                valid = (not fallen[ei_p]) and (not event_timeout[ci]) and sw_base_ci is not None and sw_pert_ci is not None
+                tensor_rows.append({
+                    'obs': onset_obs[ei_p].detach().cpu(),
+                    'delta_action': offset_cpu[ei_p],
+                    'target_dsw': float(sw_pert_ci - sw_base_ci) if valid else float('nan'),
+                    'target_abs_dsw': float(abs(sw_pert_ci - sw_base_ci)) if valid else float('nan'),
+                    'motion_id': int(mid),
+                    'dir': dk,
+                    'sign': float(sign),
+                    'delta': float(d),
+                    'repeat': int(rep),
+                    'onset_phase': float(onset_phase[ei_p]),
+                    'onset_stance': bool(onset_f0[ei_p] >= contact_thr),
+                    'T_event': int(te) if te is not None else -1,
+                    'fall': bool(fallen[ei_p]),
+                    'event_timeout': bool(event_timeout[ci]),
+                    'sw_base': float(sw_base_ci) if sw_base_ci is not None else float('nan'),
+                    'sw_pert': float(sw_pert_ci) if sw_pert_ci is not None else float('nan'),
+                    'reward_diff': float(rew_pert[ci] - rew_base[ci]) if rew_pert[ci] is not None and rew_base[ci] is not None else float('nan'),
+                    'root_disp_diff': float(root_disp_pert[ci] - root_disp_base[ci]) if root_disp_pert[ci] is not None and root_disp_base[ci] is not None else float('nan'),
+                    'valid': bool(valid),
+                    'strict_clone_state': bool(strict_clone),
+                })
 
 
     # --- 聚合 ---
@@ -420,9 +560,22 @@ def run_gate0(runner, cfg):
     for mid in motion_ids:
         for dk in directions.keys():
             for bk in sorted({bucket_of(s) for s in samples}):
-                grp = [s for s in samples if s['motion_id'] == mid and s['dir'] == dk and bucket_of(s) == bk and not s['fall']
+                all_grp = [s for s in samples if s['motion_id'] == mid and s['dir'] == dk and bucket_of(s) == bk]
+                grp = [s for s in all_grp if not s['fall'] and not s.get('event_timeout', False)
                        and s['sw_pert'] is not None and s['sw_base'] is not None]
+                if not all_grp:
+                    continue
+                fall_rate = float(np.mean([1.0 if s['fall'] else 0.0 for s in all_grp]))
+                timeout_rate = float(np.mean([1.0 if s.get('event_timeout', False) else 0.0 for s in all_grp]))
                 if not grp:
+                    key = f"m{mid}_{dk}_{bk}"
+                    summary[key] = {
+                        'n': 0, 'sign_acc': 0.0, 'effect': 0.0, 'effect_vs_noise': 0.0,
+                        'mean_dsw': None, 'mean_base': None, 'slope_dsw_per_delta': None,
+                        'fall_rate': round(fall_rate, 3), 'timeout_rate': round(timeout_rate, 3),
+                        'reward_diff_mean': None, 'root_disp_diff_mean': None,
+                        'sign_acc_thr': sign_acc_thr, 'effect_thr_mult': effect_thr_mult,
+                    }
                     continue
                 # sign accuracy: +δ → Δsw>0, −δ → Δsw<0（假设 direction 正向 = step_width 增）
                 correct = 0; total = 0
@@ -442,6 +595,10 @@ def run_gate0(runner, cfg):
                 mean_base = np.mean([s['sw_base'] for s in grp])
                 effect = mean_dsw / mean_base if mean_base > 0 else 0.0
                 effect_vs_noise = mean_dsw / noise_floor if noise_floor > 0 else float('inf')
+                reward_diffs = [s['reward_diff'] for s in grp if s.get('reward_diff') is not None]
+                root_disp_diffs = [s['root_disp_diff'] for s in grp if s.get('root_disp_diff') is not None]
+                reward_diff_mean = float(np.mean(reward_diffs)) if reward_diffs else None
+                root_disp_diff_mean = float(np.mean(root_disp_diffs)) if root_disp_diffs else None
                 # δ 线性性：Δsw vs δ 的斜率（+sign 拟合）
                 pos_d = [(dlt, dsw) for dlt, sg, dsw in dsws if sg > 0]
                 slope = None
@@ -454,6 +611,9 @@ def run_gate0(runner, cfg):
                     'effect': round(effect, 4), 'effect_vs_noise': round(effect_vs_noise, 2),
                     'mean_dsw': round(float(mean_dsw), 5), 'mean_base': round(float(mean_base), 4),
                     'slope_dsw_per_delta': round(slope, 4) if slope is not None else None,
+                    'fall_rate': round(fall_rate, 3), 'timeout_rate': round(timeout_rate, 3),
+                    'reward_diff_mean': round(reward_diff_mean, 5) if reward_diff_mean is not None else None,
+                    'root_disp_diff_mean': round(root_disp_diff_mean, 5) if root_disp_diff_mean is not None else None,
                     'sign_acc_thr': sign_acc_thr, 'effect_thr_mult': effect_thr_mult,
                 }
 
@@ -471,13 +631,14 @@ def run_gate0(runner, cfg):
     # --- 落盘 + 打印 ---
     out_dir = player.config['network_path']
     os.makedirs(out_dir, exist_ok=True)
-    out_json = osp.join(out_dir, 'gate0_response.json')
+    out_json = osp.join(out_dir, output_name)
     result = {
         'config': {
             'motion_ids': motion_ids, 'directions': list(directions.keys()),
             'deltas': deltas, 'repeats': repeats, 'contact_thr': contact_thr,
             'max_event_steps': max_event_steps, 'bucket_mode': bucket_mode,
             'noise_floor': noise_floor, 'dof_names': list(dof_names),
+            'output_name': output_name,
         },
         'samples': samples,
         'summary': summary,
@@ -485,13 +646,37 @@ def run_gate0(runner, cfg):
     with open(out_json, 'w') as f:
         json.dump(result, f, indent=2, default=str)
     print(f"[AAA Gate-0] dumped {out_json}")
+    if save_tensors:
+        out_pt = osp.join(out_dir, tensor_output_name)
+        if tensor_rows:
+            obs_tensor = torch.stack([r.pop('obs') for r in tensor_rows], dim=0)
+            delta_tensor = torch.stack([r.pop('delta_action') for r in tensor_rows], dim=0)
+        else:
+            obs_tensor = torch.empty(0, 0)
+            delta_tensor = torch.empty(0, num_actions)
+        tensor_payload = {
+            'obs': obs_tensor,
+            'delta_action': delta_tensor,
+            'rows': tensor_rows,
+            'config': result['config'],
+            'notes': {
+                'strict_clone_state': bool(strict_clone),
+                'source': 'Gate-0 v2 sustained offset response probe',
+                'target': 'event-level sw_pert - sw_base',
+            },
+        }
+        torch.save(tensor_payload, out_pt)
+        n_valid = sum(1 for r in tensor_rows if r.get('valid'))
+        print(f"[AAA Gate-0] dumped tensor dataset {out_pt} rows={len(tensor_rows)} valid={n_valid}")
 
     print("=" * 90)
     print(f"[AAA Gate-0] summary  (noise_floor={noise_floor}, sign_acc_thr={sign_acc_thr}, effect_thr×noise={effect_thr_mult})")
-    print(f"{'key':<32}{'n':>4}{'sign_acc':>10}{'effect':>9}{'×noise':>8}{'slope':>9}  verdict")
+    print(f"{'key':<40}{'n':>4}{'sign_acc':>10}{'effect':>9}{'×noise':>8}{'slope':>9}{'fall':>7}{'rewΔ':>10}{'rootΔ':>10}  verdict")
     for k, s in summary.items():
         sl = s['slope_dsw_per_delta'] if s['slope_dsw_per_delta'] is not None else float('nan')
-        print(f"{k:<32}{s['n']:>4}{s['sign_acc']:>10.3f}{s['effect']:>9.4f}{s['effect_vs_noise']:>8.2f}{sl:>9.4f}  {s['verdict']}")
+        rew = s['reward_diff_mean'] if s['reward_diff_mean'] is not None else float('nan')
+        root = s['root_disp_diff_mean'] if s['root_disp_diff_mean'] is not None else float('nan')
+        print(f"{k:<40}{s['n']:>4}{s['sign_acc']:>10.3f}{s['effect']:>9.4f}{s['effect_vs_noise']:>8.2f}{sl:>9.4f}{s['fall_rate']:>7.3f}{rew:>10.4f}{root:>10.4f}  {s['verdict']}")
     print("=" * 90)
     # 整体裁决
     rescuable = [k for k, s in summary.items() if s['verdict'] == 'ACTION_RESCUABLE']

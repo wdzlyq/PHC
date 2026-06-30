@@ -15,6 +15,10 @@ params:
     aaa_structured_step_enabled: False
     aaa_structured_disable_raw_residual: False
     aaa_structured_amp: 0.1
+    # === AAA P1.5-b: lower-body masked residual（默认 none 零回归，doc24 §3 P1.5-b）===
+    # mode=none 时 mask 全 1（零回归）；lower_body 时 SMPL dof idx 0..23(L/R Hip/Knee/Ankle/Toe)=1，
+    # 24..68(躯干/上肢)=0，raw 69D style_residual 只允许下肢子空间自由扰动，补 raw→masked→structured 中间档。
+    aaa_residual_mask_mode: none
 
     space:
       continuous:

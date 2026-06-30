@@ -64,6 +64,21 @@ class AMPBuilder(network_builder.A2CBuilder):
                 _aaa_dir[0] = 1.0 / math.sqrt(2.0)
                 _aaa_dir[12] = -1.0 / math.sqrt(2.0)
             self.register_buffer('aaa_structured_direction', _aaa_dir)
+            # === AAA P1.5-b: lower-body masked residual（默认 none 零回归，doc24 §3 P1.5-b）===
+            # 为什么：补 raw 69D → masked → structured(D2_axis0+g_local) 证据链中间档。raw 69D style_residual
+            #   自由扰动已失败(flat sweep)；masked 只允许 lower-body 子空间(L/R Hip/Knee/Ankle/Toe = SMPL dof
+            #   idx 0..23)自由，upper-body+spine 维(24..68)forward zero-out——梯度经 mask=0 自然截断，
+            #   upper-body residual 权重不更新。若 masked≈structured→"mask 一下就够"挑战 structured 必要性；
+            #   若 masked 明显弱→raw 失败→masked 中等→structured 强 证据链闭合。
+            # 做什么：mode='none' mask 全 1（零回归，旧行为）；'lower_body' idx0..23=1/24..68=0（与
+            #   aaa_structured_direction idx0=L_Hip/idx12=R_Hip 同一 SMPL 顺序，humanoid.py:1877 joint order）。
+            self.aaa_residual_mask_mode = str(params.get('aaa_residual_mask_mode', 'none'))
+            _aaa_mask = torch.ones(_aaa_act_dim)
+            if self.aaa_residual_mask_mode == 'lower_body' and _aaa_act_dim >= 24:
+                _aaa_mask.zero_()
+                _aaa_mask[:24] = 1.0  # L_Hip(0-2) L_Knee(3-5) L_Ankle(6-8) L_Toe(9-11) R_Hip(12-14) R_Knee(15-17) R_Ankle(18-20) R_Toe(21-23)
+            self.register_buffer('aaa_residual_mask', _aaa_mask)
+            # === AAA end ===
             for _p in self.actor_mlp.parameters(): _p.requires_grad_(False)
             for _p in self.mu.parameters():         _p.requires_grad_(False)
             # === AAA end ===
@@ -192,6 +207,11 @@ class AMPBuilder(network_builder.A2CBuilder):
                             _aaa_delta = self.eval_style_delta(obs, _aaa_slider)  # Δa = α·tanh(Δπ)
                             if self.aaa_structured_step_enabled:
                                 _aaa_delta = _aaa_delta + self.eval_structured_delta(obs, _aaa_slider)
+                        # === AAA P1.5-b: lower-body mask on raw style_residual ===
+                        # 为什么：masked 变体(structured_step_enabled=False)只让 lower-body 子空间的 style_residual
+                        #   生效；structured_delta 非零维在 idx 0/12(本身 lower-body)，mask 对其无影响，两配置都安全。
+                        if self.aaa_residual_mask_mode != 'none':
+                            _aaa_delta = _aaa_delta * self.aaa_residual_mask.view(1, -1)
                         mu = mu + _aaa_delta
                         # === AAA W4: 缓存 Δa 供 residual norm 惩罚（w4 patch §8.3）===
                         # 为什么：bounded 双保险的 norm 惩罚需精确 ‖Δa‖²（非 action proxy），W6 不用返工。
