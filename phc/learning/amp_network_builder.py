@@ -4,6 +4,7 @@ import phc.learning.network_builder as network_builder
 import torch
 import torch.nn as nn
 import numpy as np
+import math
 from phc.learning.style_residual import StyleResidual
 from phc.learning.slider_encoder import SliderEncoder
 
@@ -45,6 +46,24 @@ class AMPBuilder(network_builder.A2CBuilder):
                 obs_dim=_aaa_obs_dim, z_style_dim=32, action_dim=_aaa_act_dim)
             self.style_alpha = self.style_residual.style_alpha  # 暴露给 optimizer
             self.register_buffer('aaa_style_label', torch.zeros(1, 6))  # W3 固定 style 0
+            # === AAA Step C: structured scalar head (default-off) ===
+            # 为什么：Step B 已证明 D2_axis0 固定结构方向能产生可见 step_width 控制；Step C 不应回到
+            #   无结构 69D residual，而是只让 policy 学一个 scalar bias，再写入该结构方向。
+            # 做什么：新增 scalar head f(obs,z_style)->[-1,1]，方向固定为 L_Hip axis0 + / R_Hip axis0 -。
+            #   默认 aaa_structured_step_enabled=False，不改变旧 eval_actor；参数进 optimizer 但无梯度。
+            self.aaa_structured_step_enabled = bool(params.get('aaa_structured_step_enabled', False))
+            self.aaa_structured_disable_raw = bool(params.get('aaa_structured_disable_raw_residual', False))
+            self.aaa_structured_amp = float(params.get('aaa_structured_amp', 0.1))
+            self.aaa_structured_scalar_head = nn.Sequential(
+                nn.Linear(_aaa_obs_dim + 32, 128),
+                nn.ELU(),
+                nn.Linear(128, 1),
+            )
+            _aaa_dir = torch.zeros(_aaa_act_dim)
+            if _aaa_act_dim > 12:
+                _aaa_dir[0] = 1.0 / math.sqrt(2.0)
+                _aaa_dir[12] = -1.0 / math.sqrt(2.0)
+            self.register_buffer('aaa_structured_direction', _aaa_dir)
             for _p in self.actor_mlp.parameters(): _p.requires_grad_(False)
             for _p in self.mu.parameters():         _p.requires_grad_(False)
             # === AAA end ===
@@ -167,7 +186,12 @@ class AMPBuilder(network_builder.A2CBuilder):
                     # W3: obs_dict 无 'slider' 时用固定 aaa_style_label；W4 起 runner 传 raw slider
                     if self.style_enabled:
                         _aaa_slider = obs_dict.get('slider', None)
-                        _aaa_delta = self.eval_style_delta(obs, _aaa_slider)  # Δa = α·tanh(Δπ)
+                        if self.aaa_structured_step_enabled and self.aaa_structured_disable_raw:
+                            _aaa_delta = self.eval_structured_delta(obs, _aaa_slider)
+                        else:
+                            _aaa_delta = self.eval_style_delta(obs, _aaa_slider)  # Δa = α·tanh(Δπ)
+                            if self.aaa_structured_step_enabled:
+                                _aaa_delta = _aaa_delta + self.eval_structured_delta(obs, _aaa_slider)
                         mu = mu + _aaa_delta
                         # === AAA W4: 缓存 Δa 供 residual norm 惩罚（w4 patch §8.3）===
                         # 为什么：bounded 双保险的 norm 惩罚需精确 ‖Δa‖²（非 action proxy），W6 不用返工。
@@ -199,6 +223,22 @@ class AMPBuilder(network_builder.A2CBuilder):
             alpha = self.style_alpha if alpha_override is None else alpha_override
             return alpha * torch.tanh(residual)
             # === AAA end ===
+
+        def eval_structured_scalar(self, obs, slider=None):
+            # === AAA Step C: scalar structured head ===
+            # 为什么：只输出一个标量 gait bias，避免 69D residual 自由扰动。
+            # 做什么：复用 slider_encoder，输入 obs+z_style，输出 tanh-bounded scalar。
+            if slider is None:
+                slider = self.aaa_style_label.expand(obs.shape[0], -1)
+            z_style = self.slider_encoder(slider)
+            return torch.tanh(self.aaa_structured_scalar_head(torch.cat([obs, z_style], dim=-1)))
+
+        def eval_structured_delta(self, obs, slider=None, amp_override=None):
+            # === AAA Step C: scalar -> fixed D2_axis0 action direction ===
+            # 为什么：Step B fixed canary 的有效载体是 D2_axis0；训练时只学习 scalar 幅度。
+            amp = self.aaa_structured_amp if amp_override is None else amp_override
+            scalar = self.eval_structured_scalar(obs, slider)
+            return amp * scalar * self.aaa_structured_direction.view(1, -1)
         
         def get_actor_paramters(self):
             return list(self.actor_mlp.parameters()) + list(self.actor_cnn.parameters()) + list(self.mu.parameters()) 

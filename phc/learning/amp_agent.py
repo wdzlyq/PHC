@@ -34,6 +34,29 @@ def load_my_state_dict(target, saved_dict):
             target[name].copy_(param)
 
 
+# === AAA Step C3: local response proxy MLP（必须与 code/scripts/train_g_local.py 一致）===
+# 为什么：C2 训好的 g_local(obs, action_delta)->Δstep_width_at_gait_event 要在 agent 侧当 dense
+#   surrogate 冻结加载，梯度经 action_delta 回到 structured scalar head/slider_encoder（plan §680-700）。
+#   架构必须与 train_g_local.LocalResponseMLP 逐键匹配，否则 load_state_dict 失败。
+# 做什么：复制 train_g_local.py 的 LocalResponseMLP 定义；hidden 由 ckpt['config']['hidden'] 决定。
+class AAALocalResponseMLP(nn.Module):
+    def __init__(self, input_dim: int, hidden: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden),
+            nn.ELU(),
+            nn.Linear(hidden, hidden),
+            nn.ELU(),
+            nn.Linear(hidden, hidden // 2),
+            nn.ELU(),
+            nn.Linear(hidden // 2, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+# === AAA end ===
+
+
 class AMPAgent(common_agent.CommonAgent):
 
     def __init__(self, base_name, config):
@@ -89,6 +112,27 @@ class AMPAgent(common_agent.CommonAgent):
         self._aaa_joint_step_right_idx = int(config.get('aaa_joint_step_right_idx', 12))
         self._aaa_joint_step_left_sign = float(config.get('aaa_joint_step_left_sign', 1.0))
         self._aaa_joint_step_right_sign = float(config.get('aaa_joint_step_right_sign', -1.0))
+        # === AAA Step C: structured scalar head loss（默认关闭，零回归）===
+        # 为什么：Step B 证明固定 D2_axis0 动作方向可控；Step C 只训练一个 scalar head 读 slider，
+        #   再投到该方向，避免重新打开无结构 69D residual 自由度。
+        self._aaa_structured_step_coef = float(config.get('aaa_structured_step_coef', 0.0))
+        self._aaa_structured_step_margin = float(config.get('aaa_structured_step_margin', 0.05))
+        self._aaa_structured_step_amp = float(config.get('aaa_structured_step_amp', 0.1))
+        # === AAA Step C3: g_local dense surrogate（默认关闭，零回归）===
+        # 为什么：C1 structured_step_loss 用的是 action-projection margin（标量内积），只约束方向维
+        #   投影差；C3 改用 C2 训好的 g_local(obs, delta)->Δstep_width_event 作 dense differentiable
+        #   surrogate，把"高 slider 的 delta 应导致更大真实 step_width"这一物理响应直接写成可微 loss，
+        #   梯度经 delta_action 回到 scalar head，不靠 PPO advantage（plan §486-498, §667-679）。
+        # 做什么：读 g_local cfg；模型在 _aaa_ensure_g_local 懒加载（首次 train_minibatch），
+        #   统计量（obs_mean/std、delta_scale、y_mean/std）随模型一起冻结，requires_grad=False。
+        self._aaa_g_local_coef = float(config.get('aaa_g_local_coef', 0.0))
+        self._aaa_g_local_margin = float(config.get('aaa_g_local_margin', 0.03))
+        self._aaa_g_local_path = str(config.get('aaa_g_local_path', ''))
+        self._aaa_g_local_feature_mode = str(config.get('aaa_g_local_feature_mode', 'obs_delta'))
+        self._aaa_g_local_grad_clip = float(config.get('aaa_g_local_grad_clip', 0.0))
+        self._aaa_g_local = None          # 冻结的 AAALocalResponseMLP，懒加载
+        self._aaa_g_local_stats = None    # dict: obs_mean/std/delta_scale/y_mean/y_std/delta_start/...
+        # === AAA end ===
         # === AAA 诊断C: 梯度审计计数器（gated by AAA_GRAD_AUDIT env var，默认关零回归）===
         self._aaa_grad_audit_count = 0
         # === AAA end ===
@@ -288,6 +332,75 @@ class AMPAgent(common_agent.CommonAgent):
         self._aaa_step_proxy_opt.step()
         mae = torch.mean(torch.abs(pred.detach() - tgt))
         return loss.detach(), mae.detach()
+    # === AAA end ===
+
+    # === AAA Step C3: g_local 懒加载 + forward ===
+    def _aaa_ensure_g_local(self, obs_dim, action_dim):
+        # 为什么：g_local 模型依赖 ckpt 内统计量与 hidden，需在首次拿到 obs/action 维度后加载；
+        #   放 __init__ 时机太早（ppo_device/网络维度未定）。懒加载 + 一次校验，避免每个 minibatch 重读。
+        # 做什么：读 ckpt -> 建 AAALocalResponseMLP(ckpt['config']['hidden']) -> load_state_dict ->
+        #   冻结(eval+requires_grad=False) -> 缓存 stats 张量到 ppo_device。校验 feature_mode/维度一致。
+        if self._aaa_g_local is not None:
+            return
+        if self._aaa_g_local_coef <= 0.0 or not self._aaa_g_local_path:
+            return
+        import torch as _torch
+        _path = self._aaa_g_local_path
+        if not os.path.exists(_path):
+            raise FileNotFoundError(f"[AAA g_local] ckpt not found: {_path}")
+        _ckpt = _torch.load(_path, map_location=self.ppo_device)
+        _stats = _ckpt['stats']
+        _cfg = _ckpt.get('config', {})
+        _hidden = int(_cfg.get('hidden', 256))
+        _feat_mode = str(_stats.get('feature_mode', 'obs_delta'))
+        if _feat_mode != self._aaa_g_local_feature_mode:
+            raise ValueError(
+                f"[AAA g_local] feature_mode mismatch: cfg={self._aaa_g_local_feature_mode} "
+                f"but ckpt={_feat_mode}")
+        if int(_stats.get('obs_dim', -1)) != int(obs_dim):
+            raise ValueError(
+                f"[AAA g_local] obs_dim mismatch: cfg/env={obs_dim} but ckpt={_stats.get('obs_dim')}")
+        if int(_stats.get('action_dim', -1)) != int(action_dim):
+            raise ValueError(
+                f"[AAA g_local] action_dim mismatch: env={action_dim} but ckpt={_stats.get('action_dim')}")
+        _model = AAALocalResponseMLP(int(_stats['input_dim']), hidden=_hidden).to(self.ppo_device)
+        _model.load_state_dict(_ckpt['model_state'])
+        _model.eval()
+        for _p in _model.parameters():
+            _p.requires_grad_(False)
+        self._aaa_g_local = _model
+        # 缓存统计量到 ppo_device（非 nn.Buffer，因 g_local 不进 self.model；随 agent 生命周期常驻）
+        self._aaa_g_local_stats = {
+            'obs_mean': _torch.as_tensor(_stats['obs_mean'], device=self.ppo_device).float(),
+            'obs_std': _torch.as_tensor(_stats['obs_std'], device=self.ppo_device).float(),
+            'delta_scale': float(_stats['delta_scale']),
+            'y_mean': float(_stats['y_mean']),
+            'y_std': float(_stats['y_std']),
+            'delta_start': int(_stats.get('delta_start', int(_stats['obs_dim']))),
+            'obs_dim': int(_stats['obs_dim']),
+            'action_dim': int(_stats['action_dim']),
+        }
+        print(f"[AAA g_local] loaded frozen g_local from {_path} "
+              f"(feature_mode={_feat_mode}, input_dim={int(_stats['input_dim'])}, "
+              f"hidden={_hidden}, best_epoch={_ckpt.get('best_epoch')})", flush=True)
+
+    def _aaa_g_local_forward(self, obs, delta_action):
+        # 为什么：g_local 输入是 (obs_feat, delta_feat)（obs_delta 模式），输出归一化 Δstep_width，
+        #   须反标准化回真实单位做 margin 比较（plan §695）。梯度穿过 delta_action 回 scalar head。
+        # 做什么：标准化 -> forward -> 反标准化；obs 用 obs_mean/std，delta 用 delta_scale。
+        _s = self._aaa_g_local_stats
+        _obs_feat = (obs - _s['obs_mean']) / _s['obs_std']
+        _delta_feat = delta_action / _s['delta_scale']
+        if self._aaa_g_local_feature_mode == 'obs_delta':
+            _x = torch.cat([_obs_feat, _delta_feat], dim=-1)
+        elif self._aaa_g_local_feature_mode == 'delta_phase':
+            # C2 delta_phase 模式无 obs；agent 侧未采集 phase，此处不应走到（cfg 选 obs_delta）。
+            # 保留分支仅为对称；若启用需补 phase 特征。
+            _x = _delta_feat
+        else:  # full
+            _x = torch.cat([_obs_feat, _delta_feat], dim=-1)  # phase 缺省，与 ckpt 不匹配会报错
+        _pred_norm = self._aaa_g_local(_x)
+        return _pred_norm * _s['y_std'] + _s['y_mean']
     # === AAA end ===
 
     def play_steps_rnn(self):
@@ -756,6 +869,12 @@ class AMPAgent(common_agent.CommonAgent):
             _proxy_agmax = torch_ext.mean_list(train_info.get('aaa_proxy_action_grad_max', [torch.tensor(float('nan'))])).item()
             _joint_loss = torch_ext.mean_list(train_info.get('aaa_joint_step_loss', [torch.tensor(float('nan'))])).item()
             _joint_gap = torch_ext.mean_list(train_info.get('aaa_joint_step_gap', [torch.tensor(float('nan'))])).item()
+            _structured_loss = torch_ext.mean_list(train_info.get('aaa_structured_step_loss', [torch.tensor(float('nan'))])).item()
+            _structured_gap = torch_ext.mean_list(train_info.get('aaa_structured_step_gap', [torch.tensor(float('nan'))])).item()
+            _glocal_loss = torch_ext.mean_list(train_info.get('aaa_g_local_loss', [torch.tensor(float('nan'))])).item()
+            _glocal_gap = torch_ext.mean_list(train_info.get('aaa_g_local_gap', [torch.tensor(float('nan'))])).item()
+            _glocal_plow = torch_ext.mean_list(train_info.get('aaa_g_local_pred_low', [torch.tensor(float('nan'))])).item()
+            _glocal_phigh = torch_ext.mean_list(train_info.get('aaa_g_local_pred_high', [torch.tensor(float('nan'))])).item()
             print(f'[AAA probe] Ep{self.epoch_num} alpha={_sa.item():+.5f} grad={_gv:+.3e} '
                   f'r_content={getattr(self,"_probe_r_content",float("nan")):.4f} '
                   f'r_disc={getattr(self,"_probe_r_disc",float("nan")):.4f} '
@@ -764,7 +883,10 @@ class AMPAgent(common_agent.CommonAgent):
                   f'proxy_mse={_proxy_loss:.5f} proxy_mae={_proxy_mae:.5f} '
                   f'proxy_dir={_proxy_dir:+.5f} proxy_gap={_proxy_gap:+.5f} '
                   f'proxy_action_grad={_proxy_ag:.5e} proxy_action_grad_max={_proxy_agmax:.5e} '
-                  f'joint_loss={_joint_loss:+.5f} joint_gap={_joint_gap:+.5f}', flush=True)
+                  f'joint_loss={_joint_loss:+.5f} joint_gap={_joint_gap:+.5f} '
+                  f'structured_loss={_structured_loss:+.5f} structured_gap={_structured_gap:+.5f} '
+                  f'glocal_loss={_glocal_loss:+.5f} glocal_gap={_glocal_gap:+.5f} '
+                  f'glocal_plow={_glocal_plow:+.5f} glocal_phigh={_glocal_phigh:+.5f}', flush=True)
         # === AAA end ===
         
         return train_info
@@ -1092,6 +1214,82 @@ class AMPAgent(common_agent.CommonAgent):
                 joint_step_gap = torch.zeros((), device=self.ppo_device)
             # === AAA end ===
 
+            # === AAA Step C: structured scalar direction loss ===
+            # 为什么：fixed canary 已确认 D2_axis0 是 action-rescuable 方向；这里只要求 high slider
+            #   的 scalar-projected Δa 比 low slider 高 margin，梯度只需进入 scalar head/slider encoder。
+            _net = self.model.a2c_network
+            _structured_enabled = (
+                self._aaa_structured_step_coef > 0.0
+                and getattr(_net, 'style_enabled', False)
+                and hasattr(_net, 'eval_structured_delta')
+            )
+            if _structured_enabled:
+                _slider_mid = input_dict['slider'].clone()
+                _slider_low = _slider_mid.clone()
+                _slider_high = _slider_mid.clone()
+                _slider_low[:, self._aaa_contrast_dim] = 0.0
+                _slider_high[:, self._aaa_contrast_dim] = 1.0
+                _delta_low = _net.eval_structured_delta(
+                    obs_batch_processed, _slider_low, amp_override=self._aaa_structured_step_amp)
+                _delta_high = _net.eval_structured_delta(
+                    obs_batch_processed, _slider_high, amp_override=self._aaa_structured_step_amp)
+                _direction = _net.aaa_structured_direction.view(1, -1)
+                _score_low = (_delta_low * _direction).sum(dim=-1)
+                _score_high = (_delta_high * _direction).sum(dim=-1)
+                structured_step_gap = (_score_high - _score_low).mean()
+                structured_step_loss = torch.relu(
+                    self._aaa_structured_step_margin - (_score_high - _score_low)).mean()
+            else:
+                structured_step_loss = torch.zeros((), device=self.ppo_device)
+                structured_step_gap = torch.zeros((), device=self.ppo_device)
+            # === AAA end ===
+
+            # === AAA Step C3: g_local dense surrogate loss（默认关闭，零回归）===
+            # 为什么：C1 的 structured_step_loss 用 action 投影内积做 margin，未真正接上"action->step_width"
+            #   物理响应；C3 用 C2 训好的 g_local(obs, delta)->Δstep_width_event 当 dense 可微 surrogate，
+            #   约束 high slider 的 delta 经 g_local 预测的 Δstep_width 比 low slider 高 margin，
+            #   梯度经 delta_action 直通 structured scalar head/slider_encoder（plan §486-498, §667-679）。
+            # 做什么：构造 slider low/high -> eval_structured_delta 得 delta_low/high（D2_axis0 方向）->
+            #   g_local 预测 -> ReLU(margin-(pred_high-pred_low)).mean()。g_local 冻结，梯度只回 scalar head。
+            _g_local_enabled = (
+                self._aaa_g_local_coef > 0.0
+                and getattr(_net, 'style_enabled', False)
+                and hasattr(_net, 'eval_structured_delta')
+            )
+            if _g_local_enabled:
+                try:
+                    self._aaa_ensure_g_local(
+                        obs_batch.shape[-1],
+                        int(_net.aaa_structured_direction.shape[0]))
+                except Exception as _e:
+                    print(f"[AAA g_local] ensure failed (disabling for this run): {_e}", flush=True)
+                    self._aaa_g_local_coef = 0.0
+            if _g_local_enabled and self._aaa_g_local is not None:
+                _gl_slider_mid = input_dict['slider'].clone()
+                _gl_slider_low = _gl_slider_mid.clone()
+                _gl_slider_high = _gl_slider_mid.clone()
+                _gl_slider_low[:, self._aaa_contrast_dim] = 0.0
+                _gl_slider_high[:, self._aaa_contrast_dim] = 1.0
+                _gl_delta_low = _net.eval_structured_delta(
+                    obs_batch_processed, _gl_slider_low, amp_override=self._aaa_structured_step_amp)
+                _gl_delta_high = _net.eval_structured_delta(
+                    obs_batch_processed, _gl_slider_high, amp_override=self._aaa_structured_step_amp)
+                # g_local 训练在 Gate-0 raw onset_obs 上（env_reset 原始，未 RMS 归一），故喂 raw obs_batch，
+                # g_local 内部用自己的 dataset obs_mean/std 归一；不能用 obs_batch_processed（agent RMS 归一）。
+                _gl_pred_low = self._aaa_g_local_forward(obs_batch, _gl_delta_low)
+                _gl_pred_high = self._aaa_g_local_forward(obs_batch, _gl_delta_high)
+                g_local_step_gap = (_gl_pred_high - _gl_pred_low).mean()
+                g_local_step_loss = torch.relu(
+                    self._aaa_g_local_margin - (_gl_pred_high - _gl_pred_low)).mean()
+                g_local_pred_low = _gl_pred_low.detach().mean()
+                g_local_pred_high = _gl_pred_high.detach().mean()
+            else:
+                g_local_step_loss = torch.zeros((), device=self.ppo_device)
+                g_local_step_gap = torch.zeros((), device=self.ppo_device)
+                g_local_pred_low = torch.zeros((), device=self.ppo_device)
+                g_local_pred_high = torch.zeros((), device=self.ppo_device)
+            # === AAA end ===
+
             # === AAA 诊断C: 梯度审计（gated by AAA_GRAD_AUDIT，默认关零回归）===
             # 为什么：codex 4 轮 proxy/reward 改动 + Claude expC 大α长训后 sweep 仍 flat/失稳，
             #   需确认各 style loss 分量是否真进 style_residual/slider_encoder/style_alpha，
@@ -1108,6 +1306,7 @@ class AMPAgent(common_agent.CommonAgent):
                 if getattr(_net, 'style_enabled', False):
                     _audit_param_groups = {
                         'style_residual': list(_net.style_residual.parameters()),
+                        'structured_scalar': list(getattr(_net, 'aaa_structured_scalar_head', nn.Module()).parameters()),
                     }
                     _audit_losses = {
                         'a_loss(PPO)': a_loss,
@@ -1117,6 +1316,8 @@ class AMPAgent(common_agent.CommonAgent):
                         'contrast_delta_loss': contrast_delta_loss,
                         'contrast_kl_loss': contrast_kl_loss,
                         'joint_step_loss': joint_step_loss,
+                        'structured_step_loss': structured_step_loss,
+                        'g_local_step_loss': g_local_step_loss,
                         'proxy_dir_loss': proxy_dir_loss,
                     }
                     print(f"[AAA grad_audit] === minibatch #{self._aaa_grad_audit_count} ===", flush=True)
@@ -1144,7 +1345,9 @@ class AMPAgent(common_agent.CommonAgent):
                 + self._aaa_contrast_delta_coef * contrast_delta_loss \
                 + self._aaa_contrast_kl_coef * contrast_kl_loss \
                 + self._aaa_proxy_dir_coef * proxy_dir_loss \
-                + self._aaa_joint_step_coef * joint_step_loss
+                + self._aaa_joint_step_coef * joint_step_loss \
+                + self._aaa_structured_step_coef * structured_step_loss \
+                + self._aaa_g_local_coef * g_local_step_loss
             
             
             a_clip_frac = torch.mean(a_info['actor_clipped'].float())
@@ -1163,6 +1366,12 @@ class AMPAgent(common_agent.CommonAgent):
             a_info['aaa_proxy_action_grad_max'] = proxy_action_grad_max.detach()
             a_info['aaa_joint_step_loss'] = joint_step_loss.detach()
             a_info['aaa_joint_step_gap'] = joint_step_gap.detach()
+            a_info['aaa_structured_step_loss'] = structured_step_loss.detach()
+            a_info['aaa_structured_step_gap'] = structured_step_gap.detach()
+            a_info['aaa_g_local_loss'] = g_local_step_loss.detach()
+            a_info['aaa_g_local_gap'] = g_local_step_gap.detach()
+            a_info['aaa_g_local_pred_low'] = g_local_pred_low.detach()
+            a_info['aaa_g_local_pred_high'] = g_local_pred_high.detach()
             c_info['critic_loss'] = c_loss
 
             if self.multi_gpu:

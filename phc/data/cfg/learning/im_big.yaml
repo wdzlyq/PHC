@@ -10,6 +10,11 @@ params:
   network:
     name: amp
     separate: True
+    # === AAA Step C: structured scalar residual path（默认关闭，零回归）===
+    # 只学习 f(obs, slider)->scalar，再投到 Step B 验证过的 D2_axis0 方向。
+    aaa_structured_step_enabled: False
+    aaa_structured_disable_raw_residual: False
+    aaa_structured_amp: 0.1
 
     space:
       continuous:
@@ -136,6 +141,16 @@ params:
     aaa_joint_step_right_idx: 12   # SMPL R_Hip_x
     aaa_joint_step_left_sign: 1.0
     aaa_joint_step_right_sign: -1.0
+    # === AAA Step C: structured scalar head supervision（默认关闭，零回归）===
+    aaa_structured_step_coef: 0.0
+    aaa_structured_step_margin: 0.05
+    aaa_structured_step_amp: 0.1
+    # === AAA Step C3: g_local dense surrogate（默认全关，零回归；上云用 +learning.params.config.aaa_g_local_* override）===
+    aaa_g_local_coef: 0.0
+    aaa_g_local_margin: 0.03        # 初始小于 C2 target margin 0.05，避免过强（plan §686）
+    aaa_g_local_path: ""            # 指向 g_local_mlp.pt（obs_delta 版）
+    aaa_g_local_feature_mode: obs_delta
+    aaa_g_local_grad_clip: 0.0      # 默认不单独裁剪，先看 grad audit
     # === AAA end ===
 
     player:
